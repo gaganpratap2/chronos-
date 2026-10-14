@@ -45,3 +45,50 @@ func GetJob(ctx context.Context, pool *pgxpool.Pool, id int) (job.Job, error) {
 
 	return j, nil
 }
+
+
+func TransitionJobStatus(
+    ctx context.Context,
+    pool *pgxpool.Pool,
+    id int,
+    nextStatus string,
+) (job.Job, error) {
+    tx, err := pool.Begin(ctx)
+    if err != nil {
+        return job.Job{}, fmt.Errorf("begin status transition: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    var current job.Job
+
+    err = tx.QueryRow(ctx,
+        `SELECT id, name, status
+         FROM jobs
+         WHERE id = $1
+         FOR UPDATE`,
+        id,
+    ).Scan(&current.ID, &current.Name, &current.Status)
+
+    if err != nil {
+        return job.Job{}, fmt.Errorf("load job for transition: %w", err)
+    }
+
+    if err := current.TransitionTo(nextStatus); err != nil {
+        return job.Job{}, fmt.Errorf("transition job %d: %w", id, err)
+    }
+
+    _, err = tx.Exec(ctx,
+        "UPDATE jobs SET status = $1 WHERE id = $2",
+        current.Status, current.ID,
+    )
+    if err != nil {
+        return job.Job{}, fmt.Errorf("save job status: %w", err)
+    }
+
+    if err := tx.Commit(ctx); err != nil {
+        return job.Job{}, fmt.Errorf("commit status transition: %w", err)
+    }
+
+    return current, nil
+}
+
