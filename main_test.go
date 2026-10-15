@@ -10,7 +10,11 @@ import (
 	"time"
 
 	"chronos/database"
+	"github.com/joho/godotenv"
 )
+
+
+
 
 func TestHealthHandler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -32,6 +36,10 @@ func TestJobAPI(t *testing.T) {
 		context.Background(), 10*time.Second,
 	)
 	defer cancel()
+
+	if err := godotenv.Load(); err != nil {
+    	t.Log(".env not found; using system environment variables")
+	}
 
 	pool, err := database.Connect(ctx)
 	if err != nil {
@@ -135,6 +143,10 @@ func TestTransitionJobAPI(t *testing.T) {
 		context.Background(), 10*time.Second,
 	)
 	defer cancel()
+
+	if err := godotenv.Load(); err != nil {
+    	t.Log(".env not found; using system environment variables")
+	}
 
 	pool, err := database.Connect(ctx)
 	if err != nil {

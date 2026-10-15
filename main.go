@@ -17,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/joho/godotenv"
 )
 
 type CreateJobRequest struct {
@@ -174,6 +176,11 @@ func transitionJobStatusHandler(
 
 
 func main() {
+
+	if err := godotenv.Load(); err != nil {
+    log.Println(".env not found; using system environment variables")
+}
+
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		10*time.Second,

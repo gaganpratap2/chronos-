@@ -13,15 +13,11 @@ import (
 
 // SaveJob stores a job in PostgreSQL.
 func SaveJob(ctx context.Context, pool *pgxpool.Pool, j job.Job) error {
-	_, err := pool.Exec(
-		ctx,
-		"INSERT INTO jobs (id, name, status) VALUES ($1, $2, $3)",
-		// $1, $2, and $3 are PostgreSQL query parameters. They keep values separate from SQL code.
-		// Scan(&j.ID, &j.Name, &j.Status) copies the database result into your Go struct fields.
-		j.ID,
-		j.Name,
-		j.Status,
-	)
+	_, err := pool.Exec(ctx,
+        `INSERT INTO jobs (id, name, status, retry_count, max_retries)
+         VALUES ($1, $2, $3, $4, $5)`,
+        j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries,
+    )
 	if err != nil {
 		return fmt.Errorf("save job %d: %w", j.ID, err)
 	}
@@ -33,15 +29,18 @@ func SaveJob(ctx context.Context, pool *pgxpool.Pool, j job.Job) error {
 func GetJob(ctx context.Context, pool *pgxpool.Pool, id int) (job.Job, error) {
 	var j job.Job
 
-	err := pool.QueryRow(
-		ctx,
-		"SELECT id, name, status FROM jobs WHERE id = $1",
-		id,
-	).Scan(&j.ID, &j.Name, &j.Status)
+	err := pool.QueryRow(ctx,
+        `SELECT id, name, status, retry_count, max_retries
+        FROM jobs WHERE id = $1`,
+        id,
+    ).Scan(&j.ID, &j.Name, &j.Status, &j.RetryCount, &j.MaxRetries,
+    )
 
 	if err != nil {
 		return job.Job{}, fmt.Errorf("get job %d: %w", id, err)
 	}
+
+        
 
 	return j, nil
 }
@@ -60,14 +59,20 @@ func TransitionJobStatus(
     defer tx.Rollback(ctx)
 
     var current job.Job
-
+    // tx: ==> A transaction is a group of database operations treated as one unit. You can commit the changes or roll them back.
     err = tx.QueryRow(ctx,
-        `SELECT id, name, status
-         FROM jobs
-         WHERE id = $1
-         FOR UPDATE`,
-        id,
-    ).Scan(&current.ID, &current.Name, &current.Status)
+    `SELECT id, name, status, retry_count, max_retries
+     FROM jobs
+     WHERE id = $1
+     FOR UPDATE`,
+    id,
+    ).Scan(
+        &current.ID,
+        &current.Name,
+        &current.Status,
+        &current.RetryCount,
+        &current.MaxRetries,
+)
 
     if err != nil {
         return job.Job{}, fmt.Errorf("load job for transition: %w", err)
@@ -92,3 +97,54 @@ func TransitionJobStatus(
     return current, nil
 }
 
+
+func RetryJob(
+    ctx context.Context,
+    pool *pgxpool.Pool,
+    id int,
+) (job.Job, error) {
+    tx, err := pool.Begin(ctx)
+    if err != nil {
+        return job.Job{}, fmt.Errorf("begin retry: %w", err)
+    }
+    defer tx.Rollback(ctx)
+
+    var current job.Job
+
+    err = tx.QueryRow(ctx,
+        `SELECT id, name, status, retry_count, max_retries
+         FROM jobs
+         WHERE id = $1
+         FOR UPDATE`,
+        id,
+    ).Scan(
+        &current.ID,
+        &current.Name,
+        &current.Status,
+        &current.RetryCount,
+        &current.MaxRetries,
+    )
+    if err != nil {
+        return job.Job{}, fmt.Errorf("load job for retry: %w", err)
+    }
+
+    if err := current.Retry(); err != nil {
+        return job.Job{}, fmt.Errorf("retry job %d: %w", id, err)
+    }
+
+    _, err = tx.Exec(ctx,
+        `UPDATE jobs
+         SET status = $1, retry_count = $2
+         WHERE id = $3`,
+        current.Status, current.RetryCount, current.ID,
+    )
+    if err != nil {
+        return job.Job{}, fmt.Errorf("save job retry: %w", err)
+    }
+
+    if err := tx.Commit(ctx); err != nil {
+        return job.Job{}, fmt.Errorf("commit job retry: %w", err)
+    }
+
+    return current, nil
+}

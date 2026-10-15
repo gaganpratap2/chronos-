@@ -8,11 +8,15 @@ import (
 
 var ErrInvalidTransition = errors.New("invalid job status transition")
 
+
 type Job struct {
-    ID     int
-    Name   string
-    Status string
+    ID         int
+    Name       string
+    Status     string
+    RetryCount int
+    MaxRetries int
 }
+
 
 func NewJob(id int, name string) (Job, error) {
     if id <= 0 {
@@ -24,10 +28,12 @@ func NewJob(id int, name string) (Job, error) {
     }
 
     return Job{
-        ID:     id,
-        Name:   name,
-        Status: "Pending",
-    }, nil
+    ID:         id,
+    Name:       name,
+    Status:     "Pending",
+    RetryCount: 0,
+    MaxRetries: 3,
+}, nil
 }
 
 func CompletedJob(job Job) Job {
@@ -46,6 +52,31 @@ func (j *Job) TransitionTo(nextStatus string) error {
 		return nil
 	}
 
+    if j.Status == "Running" && nextStatus == "Failed" {
+        j.Status = nextStatus
+        return nil
+}
+
 	return fmt.Errorf("%w: %s -> %s",
     ErrInvalidTransition, j.Status, nextStatus)
+}
+
+
+
+func (j *Job) Retry() error {
+    if j.Status != "Failed" {
+        return fmt.Errorf(
+            "cannot retry job with status %s",
+            j.Status,
+        )
+    }
+
+    if j.RetryCount >= j.MaxRetries {
+        return fmt.Errorf("job has exhausted its retries")
+    }
+
+    j.RetryCount++
+    j.Status = "Pending"
+
+    return nil
 }
