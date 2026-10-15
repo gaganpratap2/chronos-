@@ -130,6 +130,104 @@ func TestJobAPI(t *testing.T) {
 }
 
 
+func TestTransitionJobAPI(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 10*time.Second,
+	)
+	defer cancel()
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("database connection failed: %v", err)
+	}
+	defer pool.Close()
+
+	const testID = 987656
+
+	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
+	if err != nil {
+		t.Fatalf("test setup failed: %v", err)
+	}
+	defer pool.Exec(context.Background(),
+		"DELETE FROM jobs WHERE id = $1", testID)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/jobs", createJobHandler(pool))
+	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
+	mux.HandleFunc(
+		"PATCH /jobs/{id}/status",
+		transitionJobStatusHandler(pool),
+	)
+
+	// Create a new job.
+	createReq := httptest.NewRequest(
+		http.MethodPost,
+		"/jobs",
+		strings.NewReader(
+			`{"id":987656,"name":"transition-test"}`,
+		),
+	)
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create: expected 201, got %d: %s",
+			createRec.Code, createRec.Body.String())
+	}
+
+	// Test valid and invalid transitions.
+	transitions := []struct {
+		status       string
+		expectedCode int
+	}{
+		{"Running", http.StatusOK},
+		{"Completed", http.StatusOK},
+		{"Pending", http.StatusBadRequest},
+	}
+
+	for _, transition := range transitions {
+		body := `{"status":"` + transition.status + `"}`
+
+		req := httptest.NewRequest(
+			http.MethodPatch,
+			"/jobs/987656/status",
+			strings.NewReader(body),
+		)
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != transition.expectedCode {
+			t.Errorf(
+				"transition to %s: expected %d, got %d: %s",
+				transition.status,
+				transition.expectedCode,
+				rec.Code,
+				rec.Body.String(),
+			)
+		}
+	}
+
+	// Verify the rejected transition did not change the database.
+	getReq := httptest.NewRequest(
+		http.MethodGet, "/jobs/987656", nil,
+	)
+	getRec := httptest.NewRecorder()
+	mux.ServeHTTP(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("get: expected 200, got %d", getRec.Code)
+	}
+
+	if !strings.Contains(getRec.Body.String(), `"Status":"Completed"`) {
+		t.Errorf("expected persisted status Completed, got: %s",
+			getRec.Body.String())
+	}
+}
+
 
 
 

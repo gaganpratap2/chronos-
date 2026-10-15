@@ -106,6 +106,73 @@ func getJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+
+
+func transitionJobStatusHandler(
+    pool *pgxpool.Pool,
+) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPatch {
+            http.Error(w, "method not allowed",
+                http.StatusMethodNotAllowed)
+            return
+        }
+
+        id, err := strconv.Atoi(r.PathValue("id"))
+        if err != nil || id <= 0 {
+            http.Error(w, "invalid job ID",
+                http.StatusBadRequest)
+            return
+        }
+
+        var request struct {
+            Status string `json:"status"`
+        }
+
+        if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+            http.Error(w, "invalid JSON",
+                http.StatusBadRequest)
+            return
+        }
+
+        if request.Status == "" {
+            http.Error(w, "status is required",
+                http.StatusBadRequest)
+            return
+        }
+
+        updatedJob, err := database.TransitionJobStatus(
+            r.Context(), pool, id, request.Status,
+        )
+        if err != nil {
+            if errors.Is(err, pgx.ErrNoRows) {
+                http.Error(w, "job not found",
+                    http.StatusNotFound)
+                return
+            }
+
+            if errors.Is(err, job.ErrInvalidTransition) {
+                http.Error(w, err.Error(),
+                    http.StatusBadRequest)
+                return
+            }
+
+            log.Printf("Failed to transition job %d: %v", id, err)
+            http.Error(w, "failed to transition job",
+                http.StatusInternalServerError)
+            return
+        }
+
+        w.Header().Set("Content-Type", "application/json")
+        if err := json.NewEncoder(w).Encode(updatedJob); err != nil {
+            log.Printf("Response encoding error: %v", err)
+        }
+    }
+}
+
+
+
+
 func main() {
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -119,10 +186,14 @@ func main() {
 	}
 	defer pool.Close()
 
-	mux := http.NewServeMux()
+	mux := http.NewServeMux()	
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/jobs", createJobHandler(pool))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
+	mux.HandleFunc(
+    "PATCH /jobs/{id}/status",
+    transitionJobStatusHandler(pool),
+)
 
 	fmt.Println("Chronos API listening on http://localhost:8080")
 

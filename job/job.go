@@ -3,7 +3,10 @@ package job
 
 import (
     "errors"
+    "fmt"
 )
+
+var ErrInvalidTransition = errors.New("invalid job status transition")
 
 type Job struct {
     ID     int
@@ -43,8 +46,6 @@ func (j *Job) TransitionTo(nextStatus string) error {
 		return nil
 	}
 
-	return errors.New(
-		"invalid job status transition: " +
-			j.Status + " -> " + nextStatus,
-	)
+	return fmt.Errorf("%w: %s -> %s",
+    ErrInvalidTransition, j.Status, nextStatus)
 }
