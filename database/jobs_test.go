@@ -87,6 +87,73 @@ func TestSaveAndGetJob(t *testing.T) {
 
 
 
+func TestRetryJob(t *testing.T) {
+
+    if err:= godotenv.Load("../.env"); err != nil {
+        t.Log(".env not found; using system environment variables")
+    }
+
+    ctx , cancle := context.WithTimeout(
+        context.Background(),
+        5*time.Second,
+    )
+
+    defer cancle()
+
+    pool, err := Connect(ctx)
+    if err != nil {
+        t.Fatalf("failed to connect to database: %v", err)
+    }
+    defer pool.Close()
+
+    j, err := job.NewJob(987657, "retry-test")
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    // Ensure the test row is removed even if an assertion fails.
+    defer func() {
+        _, _ = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", j.ID)
+    }()
+
+    j.Status = "Failed"
+    j.RetryCount = 1
+    j.MaxRetries = 3
+
+    _, err = pool.Exec(ctx,
+        `INSERT INTO jobs
+         (id, name, status, retry_count, max_retries)
+         VALUES ($1, $2, $3, $4, $5)`,
+        j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries,
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    got, err := RetryJob(ctx, pool, j.ID)
+    if err != nil {
+        t.Fatalf("RetryJob returned error: %v", err)
+    }
+
+    if got.Status != "Pending" {
+        t.Errorf("expected Pending, got %s", got.Status)
+    }
+    if got.RetryCount != 2 {
+        t.Errorf("expected RetryCount 2, got %d", got.RetryCount)
+    }
+
+    // Verify the values were persisted in PostgreSQL.
+    saved, err := GetJob(ctx, pool, j.ID)
+    if err != nil {
+        t.Fatal(err)
+    }
+    if saved.Status != "Pending" || saved.RetryCount != 2 {
+        t.Errorf("unexpected saved job: status=%s retry_count=%d",
+            saved.Status, saved.RetryCount)
+    }
+}
+
+
 
 func TestRetryIncrementsCount(t *testing.T) {
     j, err := job.NewJob(201, "payment")
@@ -172,5 +239,110 @@ func TestRetryLimit(t *testing.T) {
     if j.Status != "Failed" {
         t.Errorf("expected Failed after exhausted retries, got %s",
             j.Status)
+    }
+}
+
+
+
+
+func TestRetryJobRejectsNonFailedJob(t *testing.T) {
+
+    if err := godotenv.Load("../.env"); err != nil {
+        t.Log(".env not found; using system environment variables")
+    }
+
+    ctx , cancel := context.WithTimeout(
+        context.Background(),
+        5*time.Second,
+    )
+    defer cancel()
+
+    pool, err := Connect(ctx)
+    if err != nil {
+        t.Fatalf("failed to connect to database: %v", err)
+    }
+    defer pool.Close()
+
+    j, err := job.NewJob(987658, "non-failed-retry-test")
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    defer func() {
+        _, _ = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", j.ID)
+    }()
+
+    if err := SaveJob(ctx, pool, j); err != nil {
+        t.Fatal(err)
+    }
+
+    _, err = RetryJob(ctx, pool, j.ID)
+    if err == nil {
+        t.Fatal("expected retry of Pending job to fail")
+    }
+
+    saved, err := GetJob(ctx, pool, j.ID)
+    if err != nil {
+        t.Fatal(err)
+    }
+    if saved.Status != "Pending" || saved.RetryCount != 0 {
+        t.Errorf("job changed unexpectedly: status=%s retry_count=%d",
+            saved.Status, saved.RetryCount)
+    }
+}
+
+func TestRetryJobRejectsExhaustedRetries(t *testing.T) {
+    
+    if err := godotenv.Load("../.env"); err != nil {
+        t.Log(".env not found; using system environment variables")
+    }
+
+    ctx , cancel := context.WithTimeout(
+        context.Background(),
+        5*time.Second,
+    )
+    defer cancel()
+
+    pool, err := Connect(ctx)
+    if err != nil {
+        t.Fatalf("failed to connect to database: %v", err)
+    }
+    defer pool.Close()
+
+    j, err := job.NewJob(987659, "exhausted-retry-test")
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    j.Status = "Failed"
+    j.RetryCount = 3
+    j.MaxRetries = 3
+
+    defer func() {
+        _, _ = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", j.ID)
+    }()
+
+    _, err = pool.Exec(ctx,
+        `INSERT INTO jobs
+         (id, name, status, retry_count, max_retries)
+         VALUES ($1, $2, $3, $4, $5)`,
+        j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries,
+    )
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    _, err = RetryJob(ctx, pool, j.ID)
+    if err == nil {
+        t.Fatal("expected retry with exhausted limit to fail")
+    }
+
+    saved, err := GetJob(ctx, pool, j.ID)
+    if err != nil {
+        t.Fatal(err)
+    }
+    if saved.Status != "Failed" || saved.RetryCount != 3 {
+        t.Errorf("job changed unexpectedly: status=%s retry_count=%d",
+            saved.Status, saved.RetryCount)
     }
 }
