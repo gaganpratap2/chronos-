@@ -1,4 +1,3 @@
-
 package worker
 
 import (
@@ -22,7 +21,6 @@ type Worker struct {
 	Handler Handler
 }
 
-
 /*
 SaveJob()
    ↓
@@ -43,6 +41,7 @@ GetJob()
 PostgreSQL says Completed
 */
 
+// execute only one job
 func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	if w.Pool == nil {
 		return false, errors.New("worker database pool is nil")
@@ -80,4 +79,21 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	}
 
 	return true, nil
+}
+
+func (w *Worker) Run(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		ran, err := w.RunOnce(ctx)
+		if err != nil {
+			return err
+		}
+
+		if !ran {
+			return nil
+		}
+	}
 }

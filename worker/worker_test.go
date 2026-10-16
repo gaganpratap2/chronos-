@@ -65,6 +65,7 @@ func TestFakeHandler(t *testing.T) {
 
 var errTestExecution = errors.New("test execution failed")
 
+// Pending → Running → Handler succeeds → Completed
 func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 	if err := godotenv.Load("../.env"); err != nil {
 		t.Log(".env not found; using system environment variables")
@@ -137,6 +138,7 @@ func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 	}
 }
 
+// Pending → Running → Handler fails → Failed
 func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 	if err := godotenv.Load("../.env"); err != nil {
 		t.Log(".env not found; using system environment variables")
@@ -208,5 +210,103 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 
 	if saved.Status != "Failed" {
 		t.Fatalf("expected database status Failed, got %s", saved.Status)
+	}
+}
+
+// TEST MULTILE JOB EXECUTION
+
+func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	testIDs := []int{2, 3}
+
+	for _, id := range testIDs {
+		_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", id)
+		if err != nil {
+			t.Fatalf("failed to prepare test job %d: %v", id, err)
+		}
+	}
+
+	defer func() {
+		for _, id := range testIDs {
+			_, _ = pool.Exec(
+				context.Background(),
+				"DELETE FROM jobs WHERE id = $1",
+				id,
+			)
+		}
+	}()
+
+	for _, id := range testIDs {
+		j, err := job.NewJob(id, "worker-loop-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := database.SaveJob(ctx, pool, j); err != nil {
+			t.Fatalf("SaveJob failed for job %d: %v", id, err)
+		}
+	}
+
+	handler := &fakeHandler{}
+
+	w := &Worker{
+		Pool:    pool,
+		Handler: handler,
+	}
+
+	err = w.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if handler.calls != 2 {
+		t.Fatalf("expected handler to be called twice, got %d", handler.calls)
+	}
+
+	for _, id := range testIDs {
+		saved, err := database.GetJob(ctx, pool, id)
+		if err != nil {
+			t.Fatalf("GetJob failed for job %d: %v", id, err)
+		}
+
+		if saved.Status != "Completed" {
+			t.Errorf(
+				"expected job %d status Completed, got %s",
+				id,
+				saved.Status,
+			)
+		}
+	}
+}
+
+func TestWorkerRunStopsWhenContextIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	w := &Worker{}
+
+	err := w.Run(ctx)
+
+	if err == nil {
+		t.Fatal("expected Run to return context cancellation error")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
