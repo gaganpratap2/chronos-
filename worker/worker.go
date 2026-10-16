@@ -22,6 +22,27 @@ type Worker struct {
 	Handler Handler
 }
 
+
+/*
+SaveJob()
+   ↓
+Pending
+   ↓
+Worker.RunOnce()
+   ↓
+ClaimNextJob()
+   ↓
+Running
+   ↓
+fakeHandler.Execute()
+   ↓
+Completed
+   ↓
+GetJob()
+   ↓
+PostgreSQL says Completed
+*/
+
 func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	if w.Pool == nil {
 		return false, errors.New("worker database pool is nil")
