@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"chronos/database"
 	"chronos/job"
@@ -17,8 +18,9 @@ type Handler interface {
 }
 
 type Worker struct {
-	Pool    *pgxpool.Pool
-	Handler Handler
+	Pool         *pgxpool.Pool
+	Handler      Handler
+	PollInterval time.Duration
 }
 
 /*
@@ -81,7 +83,43 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+/*
+Run()
+  ↓
+RunOnce() → Job 2 → Completed
+  ↓
+RunOnce() → Job 3 → Completed
+  ↓
+RunOnce() → no job
+  ↓
+Run() returns nil
+*/
+
+// func (w *Worker) Run(ctx context.Context) error {
+// 	for {
+// 		if err := ctx.Err(); err != nil {
+// 			return err
+// 		}
+
+// 		ran, err := w.RunOnce(ctx)
+// 		if err != nil {
+// 			return err
+// 		}
+
+// 		if !ran {
+// 			return nil
+// 		}
+// 	}
+// }
+
+// Run continuously processes available jobs until the context is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
+
+	pollInterval := w.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -92,8 +130,15 @@ func (w *Worker) Run(ctx context.Context) error {
 			return err
 		}
 
-		if !ran {
-			return nil
+		if ran {
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		case <-time.After(pollInterval):
 		}
 	}
 }

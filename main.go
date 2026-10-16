@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -13,12 +12,16 @@ import (
 
 	"chronos/database"
 	"chronos/job"
+	"chronos/worker"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/joho/godotenv"
+
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 type CreateJobRequest struct {
@@ -108,78 +111,80 @@ func getJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
-
-
 func transitionJobStatusHandler(
-    pool *pgxpool.Pool,
+	pool *pgxpool.Pool,
 ) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodPatch {
-            http.Error(w, "method not allowed",
-                http.StatusMethodNotAllowed)
-            return
-        }
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch {
+			http.Error(w, "method not allowed",
+				http.StatusMethodNotAllowed)
+			return
+		}
 
-        id, err := strconv.Atoi(r.PathValue("id"))
-        if err != nil || id <= 0 {
-            http.Error(w, "invalid job ID",
-                http.StatusBadRequest)
-            return
-        }
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id <= 0 {
+			http.Error(w, "invalid job ID",
+				http.StatusBadRequest)
+			return
+		}
 
-        var request struct {
-            Status string `json:"status"`
-        }
+		var request struct {
+			Status string `json:"status"`
+		}
 
-        if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-            http.Error(w, "invalid JSON",
-                http.StatusBadRequest)
-            return
-        }
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "invalid JSON",
+				http.StatusBadRequest)
+			return
+		}
 
-        if request.Status == "" {
-            http.Error(w, "status is required",
-                http.StatusBadRequest)
-            return
-        }
+		if request.Status == "" {
+			http.Error(w, "status is required",
+				http.StatusBadRequest)
+			return
+		}
 
-        updatedJob, err := database.TransitionJobStatus(
-            r.Context(), pool, id, request.Status,
-        )
-        if err != nil {
-            if errors.Is(err, pgx.ErrNoRows) {
-                http.Error(w, "job not found",
-                    http.StatusNotFound)
-                return
-            }
+		updatedJob, err := database.TransitionJobStatus(
+			r.Context(), pool, id, request.Status,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				http.Error(w, "job not found",
+					http.StatusNotFound)
+				return
+			}
 
-            if errors.Is(err, job.ErrInvalidTransition) {
-                http.Error(w, err.Error(),
-                    http.StatusBadRequest)
-                return
-            }
+			if errors.Is(err, job.ErrInvalidTransition) {
+				http.Error(w, err.Error(),
+					http.StatusBadRequest)
+				return
+			}
 
-            log.Printf("Failed to transition job %d: %v", id, err)
-            http.Error(w, "failed to transition job",
-                http.StatusInternalServerError)
-            return
-        }
+			log.Printf("Failed to transition job %d: %v", id, err)
+			http.Error(w, "failed to transition job",
+				http.StatusInternalServerError)
+			return
+		}
 
-        w.Header().Set("Content-Type", "application/json")
-        if err := json.NewEncoder(w).Encode(updatedJob); err != nil {
-            log.Printf("Response encoding error: %v", err)
-        }
-    }
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(updatedJob); err != nil {
+			log.Printf("Response encoding error: %v", err)
+		}
+	}
 }
 
+type AppHandler struct{}
 
-
+func (h AppHandler) Execute(ctx context.Context, j job.Job) error {
+	log.Printf("Executing job %d: %s", j.ID, j.Name)
+	return nil
+}
 
 func main() {
 
 	if err := godotenv.Load(); err != nil {
-    log.Println(".env not found; using system environment variables")
-}
+		log.Println(".env not found; using system environment variables")
+	}
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -193,18 +198,72 @@ func main() {
 	}
 	defer pool.Close()
 
-	mux := http.NewServeMux()	
+	appHandler := AppHandler{}
+
+	w := &worker.Worker{
+		Pool:         pool,
+		Handler:      appHandler,
+		PollInterval: 500 * time.Millisecond,
+	}
+
+	// go func() {
+	// 	if err := w.Run(context.Background()); err != nil {
+	// 		log.Printf("Worker stopped: %v", err)
+	// 	}
+	// }()
+
+	// workerCtx, workerCancel := context.WithCancel(context.Background())
+	// defer workerCancel()
+
+	workerCtx, workerCancel := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer workerCancel()
+
+	go func() {
+		if err := w.Run(workerCtx); err != nil {
+			log.Printf("Worker stopped: %v", err)
+		}
+	}()
+
+	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/jobs", createJobHandler(pool))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
 	mux.HandleFunc(
-    "PATCH /jobs/{id}/status",
-    transitionJobStatusHandler(pool),
-)
+		"PATCH /jobs/{id}/status",
+		transitionJobStatusHandler(pool),
+	)
 
 	fmt.Println("Chronos API listening on http://localhost:8080")
 
-	if err := http.ListenAndServe(":8080", mux); err != nil {
-		log.Fatal(err)
+	// if err := http.ListenAndServe(":8080", mux); err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	<-workerCtx.Done()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
 	}
 }
