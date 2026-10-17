@@ -133,8 +133,13 @@ func RetryJob( ctx context.Context, pool *pgxpool.Pool, id int ) (job.Job, error
 		return job.Job{}, fmt.Errorf("retry job %d: %w", id, err)
 	}
 
-	nextRetryAt := time.Now().Add(1 * time.Second)
-		current.NextRetryAt = &nextRetryAt
+	// nextRetryAt := time.Now().Add(1 * time.Second)
+
+	delay := job.RetryDelay( current.RetryCount, 1*time.Second, 10*time.Second )
+	nextRetryAt := time.Now().Add(delay)
+
+
+	current.NextRetryAt = &nextRetryAt
 
 	_, err = tx.Exec(ctx,
 		`UPDATE jobs

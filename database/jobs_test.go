@@ -122,7 +122,7 @@ func TestRetryJob(t *testing.T) {
 	}()
 
 	j.Status = "Failed"
-	j.RetryCount = 1
+	j.RetryCount = 0
 	j.MaxRetries = 3
 
 	_, err = pool.Exec(ctx,
@@ -141,10 +141,11 @@ func TestRetryJob(t *testing.T) {
 	}
 
 	if got.Status != "Pending" {
-		t.Errorf("expected Pending, got %s", got.Status)
+    	t.Errorf("expected Pending, got %s", got.Status)
 	}
-	if got.RetryCount != 2 {
-		t.Errorf("expected RetryCount 2, got %d", got.RetryCount)
+
+	if got.RetryCount != 1 {
+    	t.Errorf("expected RetryCount 1, got %d", got.RetryCount)
 	}
 
 	if got.NextRetryAt == nil {
@@ -155,17 +156,25 @@ func TestRetryJob(t *testing.T) {
     	t.Error("expected NextRetryAt to be in the future")
 	}
 
-	// Verify the values were persisted in PostgreSQL.
+// Verify the values were persisted in PostgreSQL.
 	saved, err := GetJob(ctx, pool, j.ID)
 	if err != nil {
-		t.Fatal(err)
+    	t.Fatal(err)
 	}
-	if saved.Status != "Pending" || saved.RetryCount != 2 {
-		t.Errorf("unexpected saved job: status=%s retry_count=%d",
-			saved.Status, saved.RetryCount)
+
+	if saved.Status != "Pending" || saved.RetryCount != 1 {
+    	t.Errorf("unexpected saved job: status=%s retry_count=%d",
+        saved.Status, saved.RetryCount)
 	}
+
 	if saved.NextRetryAt == nil {
     	t.Fatal("expected saved NextRetryAt to be set")
+	}
+
+	remaining := time.Until(got.NextRetryAt.UTC())	
+
+	if remaining < 900*time.Millisecond || remaining > 1100*time.Millisecond {
+    	t.Fatalf("expected retry delay around 1s, got %v", remaining)
 	}
 }
 
@@ -508,6 +517,159 @@ func TestTransitionJobStatusClearsNextRetryAt(t *testing.T) {
 	if got.NextRetryAt != nil {
 		t.Fatal(
 			"expected NextRetryAt to be cleared after completion",
+		)
+	}
+}
+
+
+
+func TestRetryJobSecondRetryUsesExponentialBackoff(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	j, err := job.NewJob(987661, "retry-backoff-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	j.Status = "Failed"
+	j.RetryCount = 1
+	j.MaxRetries = 3
+
+	defer func() {
+		_, _ = pool.Exec(ctx,
+			"DELETE FROM jobs WHERE id = $1",
+			j.ID,
+		)
+	}()
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO jobs
+		 (id, name, status, retry_count, max_retries)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		j.ID,
+		j.Name,
+		j.Status,
+		j.RetryCount,
+		j.MaxRetries,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := RetryJob(ctx, pool, j.ID)
+	if err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+
+	if got.RetryCount != 2 {
+		t.Fatalf(
+			"expected RetryCount 2, got %d",
+			got.RetryCount,
+		)
+	}
+
+	if got.NextRetryAt == nil {
+		t.Fatal("expected NextRetryAt to be set")
+	}
+
+	remaining := time.Until(got.NextRetryAt.UTC())
+
+	if remaining < 1900*time.Millisecond ||
+		remaining > 2100*time.Millisecond {
+		t.Fatalf(
+			"expected retry delay around 2s, got %v",
+			remaining,
+		)
+	}
+}
+
+
+
+func TestRetryJobCapsExponentialBackoff(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	j, err := job.NewJob(987662, "retry-cap-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	j.Status = "Failed"
+	j.RetryCount = 4
+	j.MaxRetries = 6
+
+	defer func() {
+		_, _ = pool.Exec(
+			ctx,
+			"DELETE FROM jobs WHERE id = $1",
+			j.ID,
+		)
+	}()
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO jobs
+		 (id, name, status, retry_count, max_retries)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		j.ID,
+		j.Name,
+		j.Status,
+		j.RetryCount,
+		j.MaxRetries,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := RetryJob(ctx, pool, j.ID)
+	if err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+
+	if got.RetryCount != 5 {
+		t.Fatalf(
+			"expected RetryCount 5, got %d",
+			got.RetryCount,
+		)
+	}
+
+	if got.NextRetryAt == nil {
+		t.Fatal("expected NextRetryAt to be set")
+	}
+
+	remaining := time.Until(got.NextRetryAt.UTC())
+
+	if remaining < 9900*time.Millisecond ||
+		remaining > 10100*time.Millisecond {
+		t.Fatalf(
+			"expected retry delay around 10s, got %v",
+			remaining,
 		)
 	}
 }

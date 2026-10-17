@@ -81,3 +81,18 @@ func (j *Job) Retry() error {
 
     return nil
 }
+
+
+func RetryDelay( retryCount int, baseDelay time.Duration, maxDelay time.Duration ) time.Duration {
+	if retryCount <= 0 {
+		return 0
+	}
+
+	delay := baseDelay * time.Duration(1<<(retryCount-1))
+
+	if delay > maxDelay {
+		return maxDelay
+	}
+
+	return delay
+}
