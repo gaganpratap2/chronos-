@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"chronos/job"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -11,9 +12,9 @@ import (
 // SaveJob stores a job in PostgreSQL.
 func SaveJob(ctx context.Context, pool *pgxpool.Pool, j job.Job) error {
 	_, err := pool.Exec(ctx,
-		`INSERT INTO jobs (id, name, status, retry_count, max_retries)
-         VALUES ($1, $2, $3, $4, $5)`,
-		j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries,
+		`INSERT INTO jobs (id, name, status, retry_count, max_retries , next_retry_at)
+         VALUES ($1, $2, $3, $4, $5 , $6)`,
+		j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries , j.NextRetryAt,
 	)
 	if err != nil {
 		return fmt.Errorf("save job %d: %w", j.ID, err)
@@ -27,10 +28,10 @@ func GetJob(ctx context.Context, pool *pgxpool.Pool, id int) (job.Job, error) {
 	var j job.Job
 
 	err := pool.QueryRow(ctx,
-		`SELECT id, name, status, retry_count, max_retries
+		`SELECT id, name, status, retry_count, max_retries , next_retry_at
         FROM jobs WHERE id = $1`,
 		id,
-	).Scan(&j.ID, &j.Name, &j.Status, &j.RetryCount, &j.MaxRetries)
+	).Scan(&j.ID, &j.Name, &j.Status, &j.RetryCount, &j.MaxRetries , &j.NextRetryAt)
 
 	if err != nil {
 		return job.Job{}, fmt.Errorf("get job %d: %w", id, err)
@@ -54,7 +55,7 @@ func TransitionJobStatus(
 	var current job.Job
 	// tx: ==> A transaction is a group of database operations treated as one unit. You can commit the changes or roll them back.
 	err = tx.QueryRow(ctx,
-		`SELECT id, name, status, retry_count, max_retries
+		`SELECT id, name, status, retry_count, max_retries, next_retry_at
      FROM jobs
      WHERE id = $1
      FOR UPDATE`,
@@ -65,6 +66,7 @@ func TransitionJobStatus(
 		&current.Status,
 		&current.RetryCount,
 		&current.MaxRetries,
+		&current.NextRetryAt,
 	)
 
 	if err != nil {
@@ -75,10 +77,19 @@ func TransitionJobStatus(
 		return job.Job{}, fmt.Errorf("transition job %d: %w", id, err)
 	}
 
+	if nextStatus == "Completed" {
+    	current.NextRetryAt = nil
+	}
+
 	_, err = tx.Exec(ctx,
-		"UPDATE jobs SET status = $1 WHERE id = $2",
-		current.Status, current.ID,
+    	`UPDATE jobs
+     	SET status = $1, next_retry_at = $2
+     	WHERE id = $3`,
+    	current.Status,
+    	current.NextRetryAt,
+    	current.ID,
 	)
+
 	if err != nil {
 		return job.Job{}, fmt.Errorf("save job status: %w", err)
 	}
@@ -90,11 +101,8 @@ func TransitionJobStatus(
 	return current, nil
 }
 
-func RetryJob(
-	ctx context.Context,
-	pool *pgxpool.Pool,
-	id int,
-) (job.Job, error) {
+func RetryJob( ctx context.Context, pool *pgxpool.Pool, id int ) (job.Job, error) {
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("begin retry: %w", err)
@@ -104,7 +112,7 @@ func RetryJob(
 	var current job.Job
 
 	err = tx.QueryRow(ctx,
-		`SELECT id, name, status, retry_count, max_retries
+		`SELECT id, name, status, retry_count, max_retries, next_retry_at
          FROM jobs
          WHERE id = $1
          FOR UPDATE`,
@@ -115,7 +123,8 @@ func RetryJob(
 		&current.Status,
 		&current.RetryCount,
 		&current.MaxRetries,
-	)
+		&current.NextRetryAt,
+	)	
 	if err != nil {
 		return job.Job{}, fmt.Errorf("load job for retry: %w", err)
 	}
@@ -124,11 +133,14 @@ func RetryJob(
 		return job.Job{}, fmt.Errorf("retry job %d: %w", id, err)
 	}
 
+	nextRetryAt := time.Now().Add(1 * time.Second)
+		current.NextRetryAt = &nextRetryAt
+
 	_, err = tx.Exec(ctx,
 		`UPDATE jobs
-         SET status = $1, retry_count = $2
-         WHERE id = $3`,
-		current.Status, current.RetryCount, current.ID,
+         SET status = $1, retry_count = $2 , next_retry_at = $3
+         WHERE id = $4`,
+		current.Status, current.RetryCount, current.NextRetryAt, current.ID,
 	)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("save job retry: %w", err)
@@ -140,6 +152,10 @@ func RetryJob(
 
 	return current, nil
 }
+
+
+
+
 
 func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool) (job.Job, error) {
 	tx, err := pool.Begin(ctx)
@@ -154,7 +170,8 @@ func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool) (job.Job, error) {
 	err = tx.QueryRow(ctx, `
                     SELECT id , name , status , retry_count , max_retries
                     FROM jobs 
-                    where status = 'Pending'
+                    WHERE status = 'Pending'
+  					AND (next_retry_at IS NULL OR next_retry_at <= NOW())
                     ORDER BY id 
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED `,

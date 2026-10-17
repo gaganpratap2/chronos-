@@ -5,11 +5,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joho/godotenv"
+
+	// "chronos/database"
+
+
+	// "context"
+	// "testing"
+	// "time"
+
 	
 
-
+	// // "chronos/database"
 	"chronos/job"
-	"github.com/joho/godotenv"
+	// "github.com/joho/godotenv"
 )
 
 func TestSaveAndGetJob(t *testing.T) {
@@ -138,6 +147,14 @@ func TestRetryJob(t *testing.T) {
 		t.Errorf("expected RetryCount 2, got %d", got.RetryCount)
 	}
 
+	if got.NextRetryAt == nil {
+    	t.Fatal("expected NextRetryAt to be set")
+	}
+
+	if got.NextRetryAt.Before(time.Now()) {
+    	t.Error("expected NextRetryAt to be in the future")
+	}
+
 	// Verify the values were persisted in PostgreSQL.
 	saved, err := GetJob(ctx, pool, j.ID)
 	if err != nil {
@@ -146,6 +163,9 @@ func TestRetryJob(t *testing.T) {
 	if saved.Status != "Pending" || saved.RetryCount != 2 {
 		t.Errorf("unexpected saved job: status=%s retry_count=%d",
 			saved.Status, saved.RetryCount)
+	}
+	if saved.NextRetryAt == nil {
+    	t.Fatal("expected saved NextRetryAt to be set")
 	}
 }
 
@@ -404,5 +424,90 @@ func TestClaimNextJob(t *testing.T) {
 
 	if stored.Status != "Running" {
 		t.Errorf("expected database status Running, got %s", stored.Status)
+	}
+}
+
+
+
+func TestTransitionJobStatusClearsNextRetryAt(t *testing.T) {
+	ctx := context.Background()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	testID := 987660
+
+	_, _ = pool.Exec(
+		ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+	defer pool.Exec(
+		ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+
+	nextRetry := time.Now().Add(10 * time.Minute)
+
+	_, err = pool.Exec(
+		ctx,
+		`INSERT INTO jobs
+			(id, name, status, retry_count, max_retries, next_retry_at)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+		testID,
+		"transition-test",
+		"Pending",
+		1,
+		3,
+		nextRetry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = TransitionJobStatus(
+		ctx,
+		pool,
+		testID,
+		"Running",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = TransitionJobStatus(
+		ctx,
+		pool,
+		testID,
+		"Completed",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := GetJob(ctx, pool, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Status != "Completed" {
+		t.Fatalf(
+			"expected Completed, got %s",
+			got.Status,
+		)
+	}
+
+	if got.NextRetryAt != nil {
+		t.Fatal(
+			"expected NextRetryAt to be cleared after completion",
+		)
 	}
 }

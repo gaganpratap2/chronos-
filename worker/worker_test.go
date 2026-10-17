@@ -208,9 +208,20 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 		t.Fatalf("GetJob failed: %v", err)
 	}
 
-	if saved.Status != "Failed" {
-		t.Fatalf("expected database status Failed, got %s", saved.Status)
+	if saved.Status != "Pending" {
+		t.Fatalf("expected database status Pending, got %s", saved.Status)
 	}
+
+	if saved.RetryCount != 1 {
+		t.Fatalf(
+		"expected retry count 1, got %d",
+		saved.RetryCount,
+		)
+	}
+
+	if saved.NextRetryAt == nil {
+		t.Fatal("expected NextRetryAt to be set")
+	}	
 }
 
 // TEST MULTILE JOB EXECUTION

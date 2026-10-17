@@ -4,17 +4,20 @@ package job
 import (
     "errors"
     "fmt"
+    "time"
 )
 
 var ErrInvalidTransition = errors.New("invalid job status transition")
+var ErrRetriesExhausted = errors.New("job has exhausted its retries")
 
 
 type Job struct {
-    ID         int
-    Name       string
-    Status     string
-    RetryCount int
-    MaxRetries int
+    ID          int
+    Name        string
+    Status      string
+    RetryCount  int
+    MaxRetries  int
+    NextRetryAt *time.Time
 }
 
 
@@ -66,13 +69,11 @@ func (j *Job) TransitionTo(nextStatus string) error {
 func (j *Job) Retry() error {
     if j.Status != "Failed" {
         return fmt.Errorf(
-            "cannot retry job with status %s",
-            j.Status,
-        )
+            "cannot retry job with status %s", j.Status )
     }
-
+    
     if j.RetryCount >= j.MaxRetries {
-        return fmt.Errorf("job has exhausted its retries")
+        return ErrRetriesExhausted
     }
 
     j.RetryCount++

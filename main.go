@@ -255,7 +255,7 @@ func main() {
 		}
 	}()
 
-	<-workerCtx.Done()
+	<-workerCtx.Done()   //Wait until that channel is closed.
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(
 		context.Background(),
