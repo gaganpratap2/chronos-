@@ -136,6 +136,7 @@ func RetryJob( ctx context.Context, pool *pgxpool.Pool, id int ) (job.Job, error
 	// nextRetryAt := time.Now().Add(1 * time.Second)
 
 	delay := job.RetryDelay( current.RetryCount, 1*time.Second, 10*time.Second )
+	delay = job.ApplyJitter(delay, 0.20)
 	nextRetryAt := time.Now().Add(delay)
 
 

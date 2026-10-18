@@ -588,13 +588,12 @@ func TestRetryJobSecondRetryUsesExponentialBackoff(t *testing.T) {
 
 	remaining := time.Until(got.NextRetryAt.UTC())
 
-	if remaining < 1900*time.Millisecond ||
-		remaining > 2100*time.Millisecond {
-		t.Fatalf(
-			"expected retry delay around 2s, got %v",
-			remaining,
-		)
-	}
+	if remaining < 1600*time.Millisecond || remaining > 2400*time.Millisecond {
+    t.Fatalf(
+        "expected retry delay between 1.6s and 2.4s, got %v",
+        remaining,
+    )
+}
 }
 
 
@@ -665,11 +664,10 @@ func TestRetryJobCapsExponentialBackoff(t *testing.T) {
 
 	remaining := time.Until(got.NextRetryAt.UTC())
 
-	if remaining < 9900*time.Millisecond ||
-		remaining > 10100*time.Millisecond {
-		t.Fatalf(
-			"expected retry delay around 10s, got %v",
-			remaining,
-		)
-	}
+	if remaining < 8*time.Second || remaining > 12*time.Second {
+    t.Fatalf(
+        "expected retry delay between 8s and 12s, got %v",
+        remaining,
+    )
+}
 }

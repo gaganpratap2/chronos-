@@ -87,10 +87,12 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		)
 	}
 
-	return true, fmt.Errorf(
-		"job %d execution failed and was scheduled for retry: %w",
-		j.ID, err,
-	)
+	// return true, fmt.Errorf(
+	// 	"job %d execution failed and was scheduled for retry: %w",
+	// 	j.ID, err,
+	// )
+
+	return true, nil
 }	
 
 	_, err = database.TransitionJobStatus(

@@ -110,3 +110,25 @@ func TestRetryDelay(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyJitter(t *testing.T){
+    delay := 10 * time.Second
+    jitterPercentage := 0.20
+
+
+    minDelay := 8 * time.Second
+	maxDelay := 12 * time.Second
+
+    for i := 0 ; i < 100 ; i++ {
+        got := ApplyJitter(delay , jitterPercentage)
+
+        if got > maxDelay || got < minDelay {
+            t.Fatalf(
+				"jittered delay %v is outside expected range %v-%v",
+				got,
+				minDelay,
+				maxDelay,
+			)
+        }
+    }
+}

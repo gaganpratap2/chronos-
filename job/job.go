@@ -5,6 +5,7 @@ import (
     "errors"
     "fmt"
     "time"
+    "math/rand"
 )
 
 var ErrInvalidTransition = errors.New("invalid job status transition")
@@ -95,4 +96,15 @@ func RetryDelay( retryCount int, baseDelay time.Duration, maxDelay time.Duration
 	}
 
 	return delay
+}
+
+
+func ApplyJitter(delay time.Duration , jitterpercentage float64) time.Duration {
+    if(delay <= 0 || jitterpercentage <= 0){
+        return delay
+    }
+
+    jitter := float64(delay) * jitterpercentage
+    offset := (rand.Float64() * 2 -1) * jitter     // rand.Float64() generates a random number between 0 and 1.
+    return delay + time.Duration(offset) 
 }

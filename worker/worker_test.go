@@ -191,8 +191,15 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 
 	ran, err := w.RunOnce(ctx)
 
-	if err == nil {
-		t.Fatal("expected RunOnce to return an execution error")
+	// if err == nil {
+	// 	t.Fatal("expected RunOnce to return an execution error")
+	// }
+
+	if err != nil {
+    t.Fatalf(
+        "expected retryable job failure to be handled without worker error, got: %v",
+        err,
+    	)
 	}
 
 	if !ran {
@@ -425,4 +432,160 @@ func TestWorkerRunStopsWhenContextIsCancelled(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
+}
+
+
+
+// Pending → Running → Failed → Pending → Running → Completed
+func TestWorkerCompletesJobAfterRetry(t *testing .T) {
+	if err := godotenv.Load("../.env"); err != nil	{
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx , cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+
+	defer cancel()
+
+	pool , err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+
+	defer pool.Close()
+
+	const testID = 4
+	_, err = pool.Exec(ctx , "DELETE FROM jobs WHERE id = $1" , testID)
+	if err != nil {
+		t.Fatalf("failed to prepare test: %v", err)
+	}
+
+	defer func(){
+		_, _ = pool.Exec(
+			context.Background(),
+			"DELETE FROM jobs WHERE id = $1", testID,
+		)
+	}()
+
+	j , err := job.NewJob(testID , "worker-retry-lifecycle-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.SaveJob(ctx , pool , j); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	handler := &fakeHandler{
+		err : errTestExecution,
+	}
+
+	w := &Worker{
+		Pool : pool,
+		Handler : handler,
+	}
+
+	ran ,err := w.RunOnce(ctx)
+
+	// if err == nil {
+	// 	t.Fatal("expected first execution to fail")
+	// }
+
+	if err != nil {
+    t.Fatalf(
+        "expected retryable job failure to be handled without worker error, got: %v",
+        err,
+    )
+}
+
+	if !ran {
+		t.Fatal("expected worker to run the first attempt")
+	}
+
+	if handler.calls != 1 {
+		t.Fatalf(
+			"expected handler to be called once, got %d",
+			handler.calls,
+		)
+	}
+
+	saved, err := database.GetJob(ctx, pool, testID)
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+
+	if saved.Status != "Pending" {
+		t.Fatalf(
+			"expected status Pending after failure, got %s",
+			saved.Status,
+		)
+	}
+
+	if saved.RetryCount != 1 {
+		t.Fatalf(
+			"expected retry count 1, got %d",
+			saved.RetryCount,
+		)
+	}
+
+	if saved.NextRetryAt == nil {
+		t.Fatal("expected NextRetryAt to be set")
+	}
+
+	// Make the retry immediately eligible.
+	_, err = pool.Exec(
+		ctx,
+		"UPDATE jobs SET next_retry_at = NOW() WHERE id = $1",
+		testID,
+	)
+	if err != nil {
+		t.Fatalf("failed to make retry due: %v", err)
+	}
+
+	// Make the handler succeed on the retry.
+	handler.err = nil
+
+	// Second attempt should succeed.
+	ran, err = w.RunOnce(ctx)
+
+	if err != nil {
+		t.Fatalf("expected retry execution to succeed: %v", err)
+	}
+
+	if !ran {
+		t.Fatal("expected worker to run the retry")
+	}
+
+	if handler.calls != 2 {
+		t.Fatalf(
+			"expected handler to be called twice, got %d",
+			handler.calls,
+		)
+	}
+
+	saved, err = database.GetJob(ctx, pool, testID)
+	if err != nil {
+		t.Fatalf("GetJob after retry failed: %v", err)
+	}
+
+	if saved.Status != "Completed" {
+		t.Fatalf(
+			"expected final status Completed, got %s",
+			saved.Status,
+		)
+	}
+
+	if saved.RetryCount != 1 {
+		t.Fatalf(
+			"expected retry count to remain 1, got %d",
+			saved.RetryCount,
+		)
+	}
+
+	if saved.NextRetryAt != nil {
+		t.Fatal("expected NextRetryAt to be cleared after completion")
+	}
+
 }
