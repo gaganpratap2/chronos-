@@ -1,85 +1,84 @@
-
 package job
 
 import (
-
-    "testing"
-    "time"
+	"testing"
+	"time"
 )
+
 func TestNewJob(t *testing.T) {
-    j, err := NewJob(101, "payment")
+	j, err := NewJob(101, "payment")
 
-    if err != nil {
-        t.Fatalf("expected no error, got %v", err)
-    }
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
 
-    if j.ID != 101 {
-        t.Errorf("expected ID 101, got %d", j.ID)
-    }
+	if j.ID != 101 {
+		t.Errorf("expected ID 101, got %d", j.ID)
+	}
 
-    if j.Name != "payment" {
-        t.Errorf("expected name payment, got %s", j.Name)
-    }
+	if j.Name != "payment" {
+		t.Errorf("expected name payment, got %s", j.Name)
+	}
 
-    if j.Status != "Pending" {
-        t.Errorf("expected status Pending, got %s", j.Status)
-    }
+	if j.Status != "Pending" {
+		t.Errorf("expected status Pending, got %s", j.Status)
+	}
 }
 
 func TestNewJobRejectsInvalidID(t *testing.T) {
-    _, err := NewJob(0, "payment")
+	_, err := NewJob(0, "payment")
 
-    if err == nil {
-        t.Fatal("expected an error for ID 0")
-    }
+	if err == nil {
+		t.Fatal("expected an error for ID 0")
+	}
 }
 
 func TestNewJobRejectsEmptyName(t *testing.T) {
-    _, err := NewJob(101, "")
+	_, err := NewJob(101, "")
 
-    if err == nil {
-        t.Fatal("expected an error for an empty name")
-    }
+	if err == nil {
+		t.Fatal("expected an error for an empty name")
+	}
 }
 
 func TestValidStatusTransitions(t *testing.T) {
-    j, err := NewJob(101, "payment")
-    if err != nil {
-        t.Fatal(err)
-    }
+	j, err := NewJob(101, "payment")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-    if err := j.TransitionTo("Running"); err != nil {
-        t.Fatalf("expected Pending -> Running to succeed: %v", err)
-    }
+	if err := j.TransitionTo("Running"); err != nil {
+		t.Fatalf("expected Pending -> Running to succeed: %v", err)
+	}
 
-    if j.Status != "Running" {
-        t.Fatalf("expected Running, got %s", j.Status)
-    }
+	if j.Status != "Running" {
+		t.Fatalf("expected Running, got %s", j.Status)
+	}
 
-    if err := j.TransitionTo("Completed"); err != nil {
-        t.Fatalf("expected Running -> Completed to succeed: %v", err)
-    }
+	if err := j.TransitionTo("Completed"); err != nil {
+		t.Fatalf("expected Running -> Completed to succeed: %v", err)
+	}
 
-    if j.Status != "Completed" {
-        t.Errorf("expected Completed, got %s", j.Status)
-    }
+	if j.Status != "Completed" {
+		t.Errorf("expected Completed, got %s", j.Status)
+	}
 }
 
 func TestInvalidStatusTransition(t *testing.T) {
-    j, err := NewJob(101, "payment")
-    if err != nil {
-        t.Fatal(err)
-    }
+	j, err := NewJob(101, "payment")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-    err = j.TransitionTo("Completed")
+	err = j.TransitionTo("Completed")
 
-    if err == nil {
-        t.Fatal("expected an error for Pending -> Completed")
-    }
+	if err == nil {
+		t.Fatal("expected an error for Pending -> Completed")
+	}
 
-    if j.Status != "Pending" {
-        t.Errorf("expected status to remain Pending, got %s", j.Status)
-    }
+	if j.Status != "Pending" {
+		t.Errorf("expected status to remain Pending, got %s", j.Status)
+	}
 }
 
 func TestRetryDelay(t *testing.T) {
@@ -98,7 +97,10 @@ func TestRetryDelay(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := RetryDelay(tt.retryCount, baseDelay, maxDelay)
+		got := RetryDelay(tt.retryCount, RetryPolicy{
+			BaseDelay: baseDelay,
+			MaxDelay:  maxDelay,
+		})
 
 		if got != tt.expected {
 			t.Fatalf(
@@ -111,24 +113,25 @@ func TestRetryDelay(t *testing.T) {
 	}
 }
 
-func TestApplyJitter(t *testing.T){
-    delay := 10 * time.Second
-    jitterPercentage := 0.20
+func TestApplyJitter(t *testing.T) {
+	delay := 10 * time.Second
+	jitterPercentage := 0.20
 
-
-    minDelay := 8 * time.Second
+	minDelay := 8 * time.Second
 	maxDelay := 12 * time.Second
 
-    for i := 0 ; i < 100 ; i++ {
-        got := ApplyJitter(delay , jitterPercentage)
+	for i := 0; i < 100; i++ {
+		got := ApplyJitter(delay, RetryPolicy{
+			JitterPercent: jitterPercentage,
+		})
 
-        if got > maxDelay || got < minDelay {
-            t.Fatalf(
+		if got > maxDelay || got < minDelay {
+			t.Fatalf(
 				"jittered delay %v is outside expected range %v-%v",
 				got,
 				minDelay,
 				maxDelay,
 			)
-        }
-    }
+		}
+	}
 }

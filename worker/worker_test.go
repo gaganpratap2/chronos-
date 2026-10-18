@@ -196,10 +196,10 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 	// }
 
 	if err != nil {
-    t.Fatalf(
-        "expected retryable job failure to be handled without worker error, got: %v",
-        err,
-    	)
+		t.Fatalf(
+			"expected retryable job failure to be handled without worker error, got: %v",
+			err,
+		)
 	}
 
 	if !ran {
@@ -221,14 +221,14 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 
 	if saved.RetryCount != 1 {
 		t.Fatalf(
-		"expected retry count 1, got %d",
-		saved.RetryCount,
+			"expected retry count 1, got %d",
+			saved.RetryCount,
 		)
 	}
 
 	if saved.NextRetryAt == nil {
 		t.Fatal("expected NextRetryAt to be set")
-	}	
+	}
 }
 
 // TEST MULTILE JOB EXECUTION
@@ -434,22 +434,20 @@ func TestWorkerRunStopsWhenContextIsCancelled(t *testing.T) {
 	}
 }
 
-
-
 // Pending → Running → Failed → Pending → Running → Completed
-func TestWorkerCompletesJobAfterRetry(t *testing .T) {
-	if err := godotenv.Load("../.env"); err != nil	{
+func TestWorkerCompletesJobAfterRetry(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
 		t.Log(".env not found; using system environment variables")
 	}
 
-	ctx , cancel := context.WithTimeout(
+	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
 	)
 
 	defer cancel()
 
-	pool , err := database.Connect(ctx)
+	pool, err := database.Connect(ctx)
 	if err != nil {
 		t.Fatalf("failed to connect to database: %v", err)
 	}
@@ -457,48 +455,48 @@ func TestWorkerCompletesJobAfterRetry(t *testing .T) {
 	defer pool.Close()
 
 	const testID = 4
-	_, err = pool.Exec(ctx , "DELETE FROM jobs WHERE id = $1" , testID)
+	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
 	if err != nil {
 		t.Fatalf("failed to prepare test: %v", err)
 	}
 
-	defer func(){
+	defer func() {
 		_, _ = pool.Exec(
 			context.Background(),
 			"DELETE FROM jobs WHERE id = $1", testID,
 		)
 	}()
 
-	j , err := job.NewJob(testID , "worker-retry-lifecycle-test")
+	j, err := job.NewJob(testID, "worker-retry-lifecycle-test")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := database.SaveJob(ctx , pool , j); err != nil {
+	if err := database.SaveJob(ctx, pool, j); err != nil {
 		t.Fatalf("SaveJob failed: %v", err)
 	}
 
 	handler := &fakeHandler{
-		err : errTestExecution,
+		err: errTestExecution,
 	}
 
 	w := &Worker{
-		Pool : pool,
-		Handler : handler,
+		Pool:    pool,
+		Handler: handler,
 	}
 
-	ran ,err := w.RunOnce(ctx)
+	ran, err := w.RunOnce(ctx)
 
 	// if err == nil {
 	// 	t.Fatal("expected first execution to fail")
 	// }
 
 	if err != nil {
-    t.Fatalf(
-        "expected retryable job failure to be handled without worker error, got: %v",
-        err,
-    )
-}
+		t.Fatalf(
+			"expected retryable job failure to be handled without worker error, got: %v",
+			err,
+		)
+	}
 
 	if !ran {
 		t.Fatal("expected worker to run the first attempt")
@@ -588,4 +586,139 @@ func TestWorkerCompletesJobAfterRetry(t *testing .T) {
 		t.Fatal("expected NextRetryAt to be cleared after completion")
 	}
 
+}
+
+func TestWorkerRecoversRetryAfterRestart(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	const testID = 987663
+
+	_, err = pool.Exec(ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+	if err != nil {
+		t.Fatalf("failed to prepare test: %v", err)
+	}
+
+	defer pool.Exec(
+		context.Background(),
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+
+	j, err := job.NewJob(testID, "restart-recovery-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.SaveJob(ctx, pool, j); err != nil {
+		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	// Simulate the first worker failing the job.
+	if _, err := database.TransitionJobStatus(
+		ctx,
+		pool,
+		testID,
+		"Running",
+	); err != nil {
+		t.Fatalf("failed to mark job Running: %v", err)
+	}
+
+	if _, err := database.TransitionJobStatus(
+		ctx,
+		pool,
+		testID,
+		"Failed",
+	); err != nil {
+		t.Fatalf("failed to mark job Failed: %v", err)
+	}
+
+	// Schedule the retry before the worker "crashes".
+	policy := job.RetryPolicy{
+		MaxRetries:    3,
+		BaseDelay:     1 * time.Second,
+		MaxDelay:      10 * time.Second,
+		JitterPercent: 0,
+	}
+
+	if _, err := database.RetryJob(
+		ctx,
+		pool,
+		testID,
+		policy,
+	); err != nil {
+		t.Fatalf("RetryJob failed: %v", err)
+	}
+
+	// Simulate the retry becoming due while the worker is down.
+	_, err = pool.Exec(
+		ctx,
+		"UPDATE jobs SET next_retry_at = NOW() WHERE id = $1",
+		testID,
+	)
+	if err != nil {
+		t.Fatalf("failed to make retry due: %v", err)
+	}
+
+	// Start a completely new worker.
+	handler := &fakeHandler{}
+
+	worker := &Worker{
+		Pool:         pool,
+		Handler:      handler,
+		PollInterval: 10 * time.Millisecond,
+		RetryPolicy:  policy,
+	}
+
+	ran, err := worker.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("recovered worker failed: %v", err)
+	}
+
+	if !ran {
+		t.Fatal("expected recovered worker to run the job")
+	}
+
+	if handler.calls != 1 {
+		t.Fatalf("expected handler to be called once, got %d", handler.calls)
+	}
+
+	saved, err := database.GetJob(ctx, pool, testID)
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+
+	if saved.Status != "Completed" {
+		t.Fatalf(
+			"expected recovered job to be Completed, got %s",
+			saved.Status,
+		)
+	}
+
+	if saved.RetryCount != 1 {
+		t.Fatalf(
+			"expected RetryCount 1, got %d",
+			saved.RetryCount,
+		)
+	}
+
+	if saved.NextRetryAt != nil {
+		t.Fatal("expected NextRetryAt to be cleared after completion")
+	}
 }

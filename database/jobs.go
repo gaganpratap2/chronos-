@@ -14,7 +14,7 @@ func SaveJob(ctx context.Context, pool *pgxpool.Pool, j job.Job) error {
 	_, err := pool.Exec(ctx,
 		`INSERT INTO jobs (id, name, status, retry_count, max_retries , next_retry_at)
          VALUES ($1, $2, $3, $4, $5 , $6)`,
-		j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries , j.NextRetryAt,
+		j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries, j.NextRetryAt,
 	)
 	if err != nil {
 		return fmt.Errorf("save job %d: %w", j.ID, err)
@@ -31,7 +31,7 @@ func GetJob(ctx context.Context, pool *pgxpool.Pool, id int) (job.Job, error) {
 		`SELECT id, name, status, retry_count, max_retries , next_retry_at
         FROM jobs WHERE id = $1`,
 		id,
-	).Scan(&j.ID, &j.Name, &j.Status, &j.RetryCount, &j.MaxRetries , &j.NextRetryAt)
+	).Scan(&j.ID, &j.Name, &j.Status, &j.RetryCount, &j.MaxRetries, &j.NextRetryAt)
 
 	if err != nil {
 		return job.Job{}, fmt.Errorf("get job %d: %w", id, err)
@@ -78,16 +78,16 @@ func TransitionJobStatus(
 	}
 
 	if nextStatus == "Completed" {
-    	current.NextRetryAt = nil
+		current.NextRetryAt = nil
 	}
 
 	_, err = tx.Exec(ctx,
-    	`UPDATE jobs
+		`UPDATE jobs
      	SET status = $1, next_retry_at = $2
      	WHERE id = $3`,
-    	current.Status,
-    	current.NextRetryAt,
-    	current.ID,
+		current.Status,
+		current.NextRetryAt,
+		current.ID,
 	)
 
 	if err != nil {
@@ -101,7 +101,7 @@ func TransitionJobStatus(
 	return current, nil
 }
 
-func RetryJob( ctx context.Context, pool *pgxpool.Pool, id int ) (job.Job, error) {
+func RetryJob(ctx context.Context, pool *pgxpool.Pool, id int, policy job.RetryPolicy) (job.Job, error) {
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -124,7 +124,7 @@ func RetryJob( ctx context.Context, pool *pgxpool.Pool, id int ) (job.Job, error
 		&current.RetryCount,
 		&current.MaxRetries,
 		&current.NextRetryAt,
-	)	
+	)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("load job for retry: %w", err)
 	}
@@ -135,10 +135,9 @@ func RetryJob( ctx context.Context, pool *pgxpool.Pool, id int ) (job.Job, error
 
 	// nextRetryAt := time.Now().Add(1 * time.Second)
 
-	delay := job.RetryDelay( current.RetryCount, 1*time.Second, 10*time.Second )
-	delay = job.ApplyJitter(delay, 0.20)
+	delay := job.RetryDelay(current.RetryCount, policy)
+	delay = job.ApplyJitter(delay, policy)
 	nextRetryAt := time.Now().Add(delay)
-
 
 	current.NextRetryAt = &nextRetryAt
 
@@ -158,10 +157,6 @@ func RetryJob( ctx context.Context, pool *pgxpool.Pool, id int ) (job.Job, error
 
 	return current, nil
 }
-
-
-
-
 
 func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool) (job.Job, error) {
 	tx, err := pool.Begin(ctx)

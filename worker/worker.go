@@ -21,6 +21,7 @@ type Worker struct {
 	Pool         *pgxpool.Pool
 	Handler      Handler
 	PollInterval time.Duration
+	RetryPolicy  job.RetryPolicy
 }
 
 /*
@@ -62,48 +63,48 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	}
 
 	if err := w.Handler.Execute(ctx, j); err != nil {
-	_, statusErr := database.TransitionJobStatus(
-		ctx, w.Pool, j.ID, "Failed",
-	)
-	if statusErr != nil {
-		return true, fmt.Errorf(
-			"job %d execution failed: %v; recording failure: %w",
-			j.ID, err, statusErr,
+		_, statusErr := database.TransitionJobStatus(
+			ctx, w.Pool, j.ID, "Failed",
 		)
-	}
-
-	_, retryErr := database.RetryJob(ctx, w.Pool, j.ID)
-	if retryErr != nil {
-		if errors.Is(retryErr, job.ErrRetriesExhausted) {
+		if statusErr != nil {
 			return true, fmt.Errorf(
-				"job %d failed and has exhausted retries: %w",
+				"job %d execution failed: %v; recording failure: %w",
+				j.ID, err, statusErr,
+			)
+		}
+
+		_, retryErr := database.RetryJob(ctx, w.Pool, j.ID, w.RetryPolicy)
+		if retryErr != nil {
+			if errors.Is(retryErr, job.ErrRetriesExhausted) {
+				return true, fmt.Errorf(
+					"job %d failed and has exhausted retries: %w",
+					j.ID, retryErr,
+				)
+			}
+
+			return true, fmt.Errorf(
+				"job %d failed; retry scheduling failed: %w",
 				j.ID, retryErr,
 			)
 		}
 
-		return true, fmt.Errorf(
-			"job %d failed; retry scheduling failed: %w",
-			j.ID, retryErr,
-		)
+		// return true, fmt.Errorf(
+		// 	"job %d execution failed and was scheduled for retry: %w",
+		// 	j.ID, err,
+		// )
+
+		return true, nil
 	}
-
-	// return true, fmt.Errorf(
-	// 	"job %d execution failed and was scheduled for retry: %w",
-	// 	j.ID, err,
-	// )
-
-	return true, nil
-}	
 
 	_, err = database.TransitionJobStatus(
 		ctx, w.Pool, j.ID, "Completed",
 	)
 	if err != nil {
 		return true, fmt.Errorf(
-		"mark job %d completed: %w",
-		j.ID, err,
-	)
-}
+			"mark job %d completed: %w",
+			j.ID, err,
+		)
+	}
 
 	return true, nil
 }
