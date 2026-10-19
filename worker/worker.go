@@ -22,7 +22,10 @@ type Worker struct {
 	Handler      Handler
 	PollInterval time.Duration
 	RetryPolicy  job.RetryPolicy
+	WorkerID     string
 }
+
+// The Worker is responsible for picking up jobs and managing their execution. The Handler is responsible for actually doing the job.
 
 /*
 SaveJob()
@@ -54,7 +57,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		return false, errors.New("worker handler is nil")
 	}
 
-	j, err := database.ClaimNextJob(ctx, w.Pool)
+	j, err := database.ClaimNextJob(ctx, w.Pool, w.WorkerID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil

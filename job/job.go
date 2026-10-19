@@ -11,12 +11,13 @@ var ErrInvalidTransition = errors.New("invalid job status transition")
 var ErrRetriesExhausted = errors.New("job has exhausted its retries")
 
 type Job struct {
-	ID          int
-	Name        string
-	Status      string
-	RetryCount  int
-	MaxRetries  int
-	NextRetryAt *time.Time
+	ID           int
+	Name         string
+	Status       string
+	RetryCount   int
+	MaxRetries   int
+	NextRetryAt  *time.Time
+	FencingToken int64
 }
 
 type RetryPolicy struct {

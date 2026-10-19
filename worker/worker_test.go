@@ -24,6 +24,23 @@ func (f *fakeHandler) Execute(ctx context.Context, j job.Job) error {
 
 var _ Handler = (*fakeHandler)(nil)
 
+type concurrentHandler struct {
+	start    <-chan struct{}
+	finished chan<- struct{}
+}
+
+func (h *concurrentHandler) Execute(ctx context.Context, j job.Job) error {
+	<-h.start
+
+	time.Sleep(200 * time.Millisecond)
+
+	h.finished <- struct{}{}
+
+	return nil
+}
+
+var _ Handler = (*concurrentHandler)(nil)
+
 func TestWorkerRejectsMissingDependencies(t *testing.T) {
 	ctx := context.Background()
 
@@ -721,4 +738,223 @@ func TestWorkerRecoversRetryAfterRestart(t *testing.T) {
 	if saved.NextRetryAt != nil {
 		t.Fatal("expected NextRetryAt to be cleared after completion")
 	}
+}
+
+func TestTwoWorkersClaimDifferentJobs(t *testing.T) {
+	ctx := context.Background()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	job1, err := job.NewJob(122, "workerA")
+	if err != nil {
+		t.Fatalf("create job1: %v", err)
+	}
+
+	job2, err := job.NewJob(123, "workerA")
+	if err != nil {
+		t.Fatalf("create job1: %v", err)
+	}
+
+	if err := database.SaveJob(ctx, pool, job1); err != nil {
+		t.Fatalf("save job1: %v", err)
+	}
+
+	if err := database.SaveJob(ctx, pool, job2); err != nil {
+		t.Fatalf("save job2: %v", err)
+	}
+
+	defer func() {
+		_, _ = pool.Exec(ctx,
+			"DELETE FROM jobs WHERE id IN ($1, $2)",
+			job1.ID, job2.ID,
+		)
+	}()
+
+	workerA := &Worker{
+		Pool:    pool,
+		Handler: &fakeHandler{},
+	}
+
+	workerB := &Worker{
+		Pool:    pool,
+		Handler: &fakeHandler{},
+	}
+
+	claimedA, err := database.ClaimNextJob(ctx, workerA.Pool, "test-worker")
+	if err != nil {
+		t.Fatalf("worker A claim: %v", err)
+	}
+
+	claimedB, err := database.ClaimNextJob(ctx, workerB.Pool, "test-worker")
+	if err != nil {
+		t.Fatalf("worker B claim: %v", err)
+	}
+
+	if claimedA.ID == claimedB.ID {
+		t.Fatalf(
+			"both workers claimed the same job: %d",
+			claimedA.ID,
+		)
+	}
+}
+
+func TestTwoWorkersClaimConcurrently(t *testing.T) {
+	ctx := context.Background()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	job1, err := job.NewJob(987666, "concurrent-worker-a")
+	if err != nil {
+		t.Fatalf("create job1: %v", err)
+	}
+
+	job2, err := job.NewJob(987667, "concurrent-worker-b")
+	if err != nil {
+		t.Fatalf("create job2: %v", err)
+	}
+
+	if err := database.SaveJob(ctx, pool, job1); err != nil {
+		t.Fatalf("save job1: %v", err)
+	}
+
+	if err := database.SaveJob(ctx, pool, job2); err != nil {
+		t.Fatalf("save job2: %v", err)
+	}
+
+	defer func() {
+		_, _ = pool.Exec(ctx,
+			"DELETE FROM jobs WHERE id IN ($1, $2)",
+			job1.ID, job2.ID,
+		)
+	}()
+
+	type result struct {
+		job job.Job
+		err error
+	}
+
+	results := make(chan result, 2)
+
+	go func() {
+		j, err := database.ClaimNextJob(ctx, pool, "test-worker")
+		results <- result{job: j, err: err}
+	}()
+
+	go func() {
+		j, err := database.ClaimNextJob(ctx, pool, "test-worker")
+		results <- result{job: j, err: err}
+	}()
+
+	first := <-results
+	second := <-results
+
+	if first.err != nil {
+		t.Fatalf("first worker claim: %v", first.err)
+	}
+
+	if second.err != nil {
+		t.Fatalf("second worker claim: %v", second.err)
+	}
+
+	if first.job.ID == second.job.ID {
+		t.Fatalf(
+			"both workers claimed the same job: %d",
+			first.job.ID,
+		)
+	}
+}
+
+func TestTwoWorkersExecuteDifferentJobsConcurrently(t *testing.T) {
+	ctx := context.Background()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	job1, err := job.NewJob(987668, "concurrent-execution-a")
+	if err != nil {
+		t.Fatalf("create job1: %v", err)
+	}
+
+	job2, err := job.NewJob(987669, "concurrent-execution-b")
+	if err != nil {
+		t.Fatalf("create job2: %v", err)
+	}
+
+	if err := database.SaveJob(ctx, pool, job1); err != nil {
+		t.Fatalf("save job1: %v", err)
+	}
+
+	if err := database.SaveJob(ctx, pool, job2); err != nil {
+		t.Fatalf("save job2: %v", err)
+	}
+
+	defer func() {
+		_, _ = pool.Exec(ctx,
+			"DELETE FROM jobs WHERE id IN ($1, $2)",
+			job1.ID, job2.ID,
+		)
+	}()
+
+	start := make(chan struct{})
+	finished := make(chan struct{}, 2)
+
+	handler := &concurrentHandler{
+		start:    start,
+		finished: finished,
+	}
+
+	workerA := &Worker{
+		Pool:    pool,
+		Handler: handler,
+	}
+
+	workerB := &Worker{
+		Pool:    pool,
+		Handler: handler,
+	}
+
+	results := make(chan error, 2)
+
+	go func() {
+		_, err := workerA.RunOnce(ctx)
+		results <- err
+	}()
+
+	go func() {
+		_, err := workerB.RunOnce(ctx)
+		results <- err
+	}()
+
+	close(start)
+
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("worker returned error: %v", err)
+		}
+	}
+
+	close(finished)
 }

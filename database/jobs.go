@@ -46,6 +46,7 @@ func TransitionJobStatus(
 	id int,
 	nextStatus string,
 ) (job.Job, error) {
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("begin status transition: %w", err)
@@ -158,7 +159,7 @@ func RetryJob(ctx context.Context, pool *pgxpool.Pool, id int, policy job.RetryP
 	return current, nil
 }
 
-func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool) (job.Job, error) {
+func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool, workerID string) (job.Job, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return job.Job{}, fmt.Errorf("begin claim transaction: %w", err)
@@ -169,7 +170,7 @@ func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool) (job.Job, error) {
 	var current job.Job
 
 	err = tx.QueryRow(ctx, `
-                    SELECT id , name , status , retry_count , max_retries
+                    SELECT id , name , status , retry_count , max_retries , next_retry_at, fencing_token
                     FROM jobs 
                     WHERE status = 'Pending'
   					AND (next_retry_at IS NULL OR next_retry_at <= NOW())
@@ -180,7 +181,10 @@ func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool) (job.Job, error) {
 		&current.Name,
 		&current.Status,
 		&current.RetryCount,
-		&current.MaxRetries)
+		&current.MaxRetries,
+		&current.NextRetryAt,
+		&current.FencingToken,
+	)
 
 	if err != nil {
 		return job.Job{}, fmt.Errorf("find pending job: %w", err)
@@ -190,12 +194,29 @@ func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool) (job.Job, error) {
 		return job.Job{}, fmt.Errorf("claim job: %w", err)
 	}
 
-	_, err = tx.Exec(ctx, `
-                    UPDATE jobs
-                    SET status = $1
-                    WHERE id = $2        
-        `, current.Status, current.ID,
-	)
+	// _, err = tx.Exec(ctx, `
+	// 	UPDATE jobs
+	// 	SET status = $1,
+	// 	    worker_id = $2
+	// 	WHERE id = $3
+	// `, current.Status, workerID, current.ID)
+
+	// _, err = tx.Exec(ctx, `
+	// UPDATE jobs
+	// SET status = 'Running',
+	// worker_id = $2,
+	// fencing_token = fencing_token + 1
+	// WHERE id = $1
+	// `, current.ID, workerID)
+
+	err = tx.QueryRow(ctx, `
+    UPDATE jobs
+    SET status = 'Running',
+        worker_id = $2,
+        fencing_token = fencing_token + 1
+    WHERE id = $1
+    RETURNING fencing_token
+`, current.ID, workerID).Scan(&current.FencingToken)
 
 	if err != nil {
 		return job.Job{}, fmt.Errorf("update claimed job: %w", err)
