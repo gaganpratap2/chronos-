@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	// "log"
 	"time"
 
 	"chronos/database"
@@ -18,11 +19,12 @@ type Handler interface {
 }
 
 type Worker struct {
-	Pool         *pgxpool.Pool
-	Handler      Handler
-	PollInterval time.Duration
-	RetryPolicy  job.RetryPolicy
-	WorkerID     string
+	WorkerID          string
+	Pool              *pgxpool.Pool
+	Handler           Handler
+	PollInterval      time.Duration
+	RetryPolicy       job.RetryPolicy
+	HeartbeatInterval time.Duration
 }
 
 // The Worker is responsible for picking up jobs and managing their execution. The Handler is responsible for actually doing the job.
@@ -65,47 +67,101 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("claim job: %w", err)
 	}
 
-	if err := w.Handler.Execute(ctx, j); err != nil {
+	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	heartbeatErrCh := make(chan error, 1)
+
+	go func() {
+		heartbeatErr := w.heartbeat(
+			heartbeatCtx,
+			j.ID,
+			j.FencingToken,
+		)
+
+		if heartbeatErr != nil {
+			heartbeatCancel()
+		}
+
+		heartbeatErrCh <- heartbeatErr
+	}()
+
+	// Execute the handler exactly once, using the heartbeat context.
+	executionErr := w.Handler.Execute(heartbeatCtx, j)
+
+	// Stop the heartbeat and wait for it to exit.
+	heartbeatCancel()
+	heartbeatErr := <-heartbeatErrCh
+
+	// If the heartbeat failed, do not write a job status
+	// using ownership that may no longer be valid.
+	if heartbeatErr != nil {
+		return true, fmt.Errorf(
+			"job %d heartbeat failed; ownership could not be confirmed: %w",
+			j.ID,
+			heartbeatErr,
+		)
+	}
+
+	if ctx.Err() != nil {
+		return true, ctx.Err()
+	}
+
+	// Handle execution failure using the existing retry logic.
+	if executionErr != nil {
 		_, statusErr := database.TransitionJobStatus(
-			ctx, w.Pool, j.ID, "Failed",
+			ctx,
+			w.Pool,
+			j.ID,
+			"Failed",
+			j.FencingToken,
 		)
 		if statusErr != nil {
 			return true, fmt.Errorf(
 				"job %d execution failed: %v; recording failure: %w",
-				j.ID, err, statusErr,
+				j.ID,
+				executionErr,
+				statusErr,
 			)
 		}
 
-		_, retryErr := database.RetryJob(ctx, w.Pool, j.ID, w.RetryPolicy)
+		_, retryErr := database.RetryJob(
+			ctx,
+			w.Pool,
+			j.ID,
+			w.RetryPolicy,
+			j.FencingToken,
+		)
 		if retryErr != nil {
 			if errors.Is(retryErr, job.ErrRetriesExhausted) {
 				return true, fmt.Errorf(
 					"job %d failed and has exhausted retries: %w",
-					j.ID, retryErr,
+					j.ID,
+					retryErr,
 				)
 			}
 
 			return true, fmt.Errorf(
 				"job %d failed; retry scheduling failed: %w",
-				j.ID, retryErr,
+				j.ID,
+				retryErr,
 			)
 		}
-
-		// return true, fmt.Errorf(
-		// 	"job %d execution failed and was scheduled for retry: %w",
-		// 	j.ID, err,
-		// )
 
 		return true, nil
 	}
 
+	// The handler succeeded. Mark the job completed.
 	_, err = database.TransitionJobStatus(
-		ctx, w.Pool, j.ID, "Completed",
+		ctx,
+		w.Pool,
+		j.ID,
+		"Completed",
+		j.FencingToken,
 	)
 	if err != nil {
 		return true, fmt.Errorf(
 			"mark job %d completed: %w",
-			j.ID, err,
+			j.ID,
+			err,
 		)
 	}
 
@@ -123,23 +179,6 @@ RunOnce() → no job
   ↓
 Run() returns nil
 */
-
-// func (w *Worker) Run(ctx context.Context) error {
-// 	for {
-// 		if err := ctx.Err(); err != nil {
-// 			return err
-// 		}
-
-// 		ran, err := w.RunOnce(ctx)
-// 		if err != nil {
-// 			return err
-// 		}
-
-// 		if !ran {
-// 			return nil
-// 		}
-// 	}
-// }
 
 // Run continuously processes available jobs until the context is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
@@ -168,6 +207,46 @@ func (w *Worker) Run(ctx context.Context) error {
 			return ctx.Err()
 
 		case <-time.After(pollInterval):
+		}
+	}
+}
+
+func (w *Worker) heartbeat(
+	ctx context.Context,
+	jobID int,
+	fencingToken int64,
+) error {
+	interval := w.HeartbeatInterval
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+
+		case <-ticker.C:
+			err := database.RenewJobLease(
+				ctx,
+				w.Pool,
+				jobID,
+				fencingToken,
+			)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+
+				return fmt.Errorf(
+					"heartbeat failed for job %d: %w",
+					jobID,
+					err,
+				)
+			}
 		}
 	}
 }

@@ -17,6 +17,8 @@ type Job struct {
 	RetryCount   int
 	MaxRetries   int
 	NextRetryAt  *time.Time
+	WorkerID     string
+	LeaseUntil   *time.Time
 	FencingToken int64
 }
 

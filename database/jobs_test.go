@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,6 +135,7 @@ func TestRetryJob(t *testing.T) {
 			MaxDelay:      10 * time.Second,
 			JitterPercent: 0.20,
 		},
+		0,
 	)
 	if err != nil {
 		t.Fatalf("RetryJob returned error: %v", err)
@@ -305,6 +307,7 @@ func TestRetryJobRejectsNonFailedJob(t *testing.T) {
 			MaxDelay:      10 * time.Second,
 			JitterPercent: 0.20,
 		},
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected retry of Pending job to fail")
@@ -371,6 +374,7 @@ func TestRetryJobRejectsExhaustedRetries(t *testing.T) {
 			MaxDelay:      10 * time.Second,
 			JitterPercent: 0.20,
 		},
+		0,
 	)
 	if err == nil {
 		t.Fatal("expected retry with exhausted limit to fail")
@@ -468,7 +472,7 @@ func TestTransitionJobStatusClearsNextRetryAt(t *testing.T) {
 	}
 	defer pool.Close()
 
-	testID := 987660
+	testID := 786
 
 	_, _ = pool.Exec(
 		ctx,
@@ -482,19 +486,22 @@ func TestTransitionJobStatusClearsNextRetryAt(t *testing.T) {
 	)
 
 	nextRetry := time.Now().Add(10 * time.Minute)
+	fencingToken := int64(0)
 
-	_, err = pool.Exec(
-		ctx,
+	_, err = pool.Exec(ctx,
 		`INSERT INTO jobs
-			(id, name, status, retry_count, max_retries, next_retry_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
+        (id, name, status, retry_count, max_retries,
+         next_retry_at, fencing_token)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		testID,
 		"transition-test",
 		"Pending",
 		1,
 		3,
 		nextRetry,
+		fencingToken,
 	)
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,6 +511,7 @@ func TestTransitionJobStatusClearsNextRetryAt(t *testing.T) {
 		pool,
 		testID,
 		"Running",
+		fencingToken,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -514,6 +522,7 @@ func TestTransitionJobStatusClearsNextRetryAt(t *testing.T) {
 		pool,
 		testID,
 		"Completed",
+		fencingToken,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -538,6 +547,120 @@ func TestTransitionJobStatusClearsNextRetryAt(t *testing.T) {
 	}
 }
 
+func TestClaimNextJobRecoversExpiredLease(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	const testID = 987665
+
+	_, err = pool.Exec(
+		ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+	if err != nil {
+		t.Fatalf("failed to prepare test: %v", err)
+	}
+
+	defer pool.Exec(
+		context.Background(),
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO jobs
+		(id, name, status, retry_count, max_retries,
+		 next_retry_at, worker_id, lease_until, fencing_token)
+		VALUES ($1, $2, 'Running', 0, 3, NULL, $3, NOW() - INTERVAL '1 second', $4)`,
+		testID,
+		"expired-lease-test",
+		"worker-A",
+		int64(5),
+	)
+	if err != nil {
+		t.Fatalf("failed to insert test job: %v", err)
+	}
+
+	claimed, err := ClaimNextJob(
+		ctx,
+		pool,
+		"worker-B",
+	)
+	if err != nil {
+		t.Fatalf("ClaimNextJob failed: %v", err)
+	}
+
+	if claimed.ID != testID {
+		t.Fatalf(
+			"expected claimed job ID %d, got %d",
+			testID,
+			claimed.ID,
+		)
+	}
+
+	if claimed.Status != "Running" {
+		t.Fatalf(
+			"expected status Running, got %s",
+			claimed.Status,
+		)
+	}
+
+	if claimed.FencingToken != 6 {
+		t.Fatalf(
+			"expected fencing token 6, got %d",
+			claimed.FencingToken,
+		)
+	}
+
+	stored, err := GetJob(ctx, pool, testID)
+	if err != nil {
+		t.Fatalf("GetJob failed: %v", err)
+	}
+
+	if stored.Status != "Running" {
+		t.Fatalf(
+			"expected stored status Running, got %s",
+			stored.Status,
+		)
+	}
+
+	if stored.FencingToken != 6 {
+		t.Fatalf(
+			"expected stored fencing token 6, got %d",
+			stored.FencingToken,
+		)
+	}
+
+	if stored.WorkerID != "worker-B" {
+		t.Fatalf(
+			"expected worker-B to own job, got %s",
+			stored.WorkerID,
+		)
+	}
+
+	if stored.LeaseUntil == nil {
+		t.Fatal("expected new lease to be assigned")
+	}
+
+	if !stored.LeaseUntil.After(time.Now()) {
+		t.Fatal("expected new lease to be in the future")
+	}
+}
+
 func TestRetryJobSecondRetryUsesExponentialBackoff(t *testing.T) {
 	if err := godotenv.Load("../.env"); err != nil {
 		t.Log(".env not found; using system environment variables")
@@ -555,7 +678,7 @@ func TestRetryJobSecondRetryUsesExponentialBackoff(t *testing.T) {
 	}
 	defer pool.Close()
 
-	j, err := job.NewJob(987661, "retry-backoff-test")
+	j, err := job.NewJob(32345, "retry-backoff-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,6 +718,7 @@ func TestRetryJobSecondRetryUsesExponentialBackoff(t *testing.T) {
 			MaxDelay:      10 * time.Second,
 			JitterPercent: 0.20,
 		},
+		0,
 	)
 	if err != nil {
 		t.Fatalf("RetryJob returned error: %v", err)
@@ -679,6 +803,7 @@ func TestRetryJobCapsExponentialBackoff(t *testing.T) {
 			MaxDelay:      10 * time.Second,
 			JitterPercent: 0.20,
 		},
+		0,
 	)
 	if err != nil {
 		t.Fatalf("RetryJob returned error: %v", err)
@@ -746,4 +871,207 @@ func TestClaimNextJobIncrementsFencingToken(t *testing.T) {
 		)
 	}
 
+}
+
+func TestTransitionJobStatusRejectsStaleFencingToken(t *testing.T) {
+	ctx := context.Background()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	testID := 987661
+
+	_, err = pool.Exec(ctx, `
+		DELETE FROM jobs
+		WHERE id = $1
+	`, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO jobs (
+			id,
+			name,
+			status,
+			retry_count,
+			max_retries,
+			fencing_token
+		)
+		VALUES ($1, 'stale-token-test', 'Running', 0, 3, 2)
+	`, testID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = TransitionJobStatus(
+		ctx,
+		pool,
+		testID,
+		"Completed",
+		1,
+	)
+
+	if err == nil {
+		t.Fatal("expected stale fencing token error")
+	}
+
+	if !strings.Contains(err.Error(), "stale fencing token") {
+		t.Fatalf("expected stale fencing token error, got: %v", err)
+	}
+}
+
+func TestRenewJobLease(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	const testID = 987666
+	const fencingToken int64 = 5
+
+	_, err = pool.Exec(
+		ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+	if err != nil {
+		t.Fatalf("failed to prepare test: %v", err)
+	}
+
+	defer pool.Exec(
+		context.Background(),
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO jobs
+		(id, name, status, retry_count, max_retries,
+		 worker_id, lease_until, fencing_token)
+		VALUES ($1, $2, 'Running', 0, 3, $3,
+		        NOW() + INTERVAL '1 second', $4)`,
+		testID,
+		"lease-renew-test",
+		"worker-A",
+		fencingToken,
+	)
+	if err != nil {
+		t.Fatalf("failed to insert test job: %v", err)
+	}
+
+	before, err := GetJob(ctx, pool, testID)
+	if err != nil {
+		t.Fatalf("GetJob before renewal failed: %v", err)
+	}
+
+	if before.LeaseUntil == nil {
+		t.Fatal("expected existing lease")
+	}
+
+	err = RenewJobLease(
+		ctx,
+		pool,
+		testID,
+		fencingToken,
+	)
+	if err != nil {
+		t.Fatalf("RenewJobLease failed: %v", err)
+	}
+
+	after, err := GetJob(ctx, pool, testID)
+	if err != nil {
+		t.Fatalf("GetJob after renewal failed: %v", err)
+	}
+
+	if after.LeaseUntil == nil {
+		t.Fatal("expected renewed lease")
+	}
+
+	if !after.LeaseUntil.After(*before.LeaseUntil) {
+		t.Fatalf(
+			"expected renewed lease %v to be after previous lease %v",
+			*after.LeaseUntil,
+			*before.LeaseUntil,
+		)
+	}
+}
+
+func TestRenewJobLeaseRejectsStaleFencingToken(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	const testID = 987667
+
+	_, err = pool.Exec(
+		ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+	if err != nil {
+		t.Fatalf("failed to prepare test: %v", err)
+	}
+
+	defer pool.Exec(
+		context.Background(),
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO jobs
+		(id, name, status, retry_count, max_retries,
+		 worker_id, lease_until, fencing_token)
+		VALUES ($1, $2, 'Running', 0, 3, $3,
+		        NOW() + INTERVAL '30 seconds', $4)`,
+		testID,
+		"stale-heartbeat-test",
+		"worker-B",
+		int64(6),
+	)
+	if err != nil {
+		t.Fatalf("failed to insert test job: %v", err)
+	}
+
+	err = RenewJobLease(
+		ctx,
+		pool,
+		testID,
+		5,
+	)
+
+	if err == nil {
+		t.Fatal("expected stale fencing token to be rejected")
+	}
 }

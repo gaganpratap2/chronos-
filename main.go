@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"chronos/database"
@@ -18,10 +21,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
-
-	"os"
-	"os/signal"
-	"syscall"
 )
 
 type CreateJobRequest struct {
@@ -111,58 +110,54 @@ func getJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
-func transitionJobStatusHandler(
-	pool *pgxpool.Pool,
-) http.HandlerFunc {
+func transitionJobStatusHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPatch {
-			http.Error(w, "method not allowed",
-				http.StatusMethodNotAllowed)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		id, err := strconv.Atoi(r.PathValue("id"))
 		if err != nil || id <= 0 {
-			http.Error(w, "invalid job ID",
-				http.StatusBadRequest)
+			http.Error(w, "invalid job ID", http.StatusBadRequest)
 			return
 		}
 
 		var request struct {
-			Status string `json:"status"`
+			Status       string `json:"status"`
+			FencingToken int64  `json:"fencing_token"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(w, "invalid JSON",
-				http.StatusBadRequest)
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
 
 		if request.Status == "" {
-			http.Error(w, "status is required",
-				http.StatusBadRequest)
+			http.Error(w, "status is required", http.StatusBadRequest)
 			return
 		}
 
 		updatedJob, err := database.TransitionJobStatus(
-			r.Context(), pool, id, request.Status,
+			r.Context(),
+			pool,
+			id,
+			request.Status,
+			request.FencingToken,
 		)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				http.Error(w, "job not found",
-					http.StatusNotFound)
+				http.Error(w, "job not found", http.StatusNotFound)
 				return
 			}
 
 			if errors.Is(err, job.ErrInvalidTransition) {
-				http.Error(w, err.Error(),
-					http.StatusBadRequest)
+				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 
 			log.Printf("Failed to transition job %d: %v", id, err)
-			http.Error(w, "failed to transition job",
-				http.StatusInternalServerError)
+			http.Error(w, "failed to transition job", http.StatusInternalServerError)
 			return
 		}
 
@@ -181,7 +176,6 @@ func (h AppHandler) Execute(ctx context.Context, j job.Job) error {
 }
 
 func main() {
-
 	if err := godotenv.Load(); err != nil {
 		log.Println(".env not found; using system environment variables")
 	}
@@ -200,20 +194,20 @@ func main() {
 
 	appHandler := AppHandler{}
 
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Fatalf("failed to get hostname: %v", err)
+	}
+
+	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+	log.Printf("Starting worker with ID: %s", workerID)
+
 	w := &worker.Worker{
+		WorkerID:     workerID,
 		Pool:         pool,
 		Handler:      appHandler,
 		PollInterval: 500 * time.Millisecond,
 	}
-
-	// go func() {
-	// 	if err := w.Run(context.Background()); err != nil {
-	// 		log.Printf("Worker stopped: %v", err)
-	// 	}
-	// }()
-
-	// workerCtx, workerCancel := context.WithCancel(context.Background())
-	// defer workerCancel()
 
 	workerCtx, workerCancel := signal.NotifyContext(
 		context.Background(),
@@ -239,10 +233,6 @@ func main() {
 
 	fmt.Println("Chronos API listening on http://localhost:8080")
 
-	// if err := http.ListenAndServe(":8080", mux); err != nil {
-	// 	log.Fatal(err)
-	// }
-
 	server := &http.Server{
 		Addr:    ":8080",
 		Handler: mux,
@@ -252,10 +242,11 @@ func main() {
 		if err := server.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
 			log.Printf("HTTP server error: %v", err)
+			workerCancel()
 		}
 	}()
 
-	<-workerCtx.Done()   //Wait until that channel is closed.
+	<-workerCtx.Done()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(
 		context.Background(),

@@ -208,10 +208,6 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 
 	ran, err := w.RunOnce(ctx)
 
-	// if err == nil {
-	// 	t.Fatal("expected RunOnce to return an execution error")
-	// }
-
 	if err != nil {
 		t.Fatalf(
 			"expected retryable job failure to be handled without worker error, got: %v",
@@ -247,90 +243,6 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 		t.Fatal("expected NextRetryAt to be set")
 	}
 }
-
-// TEST MULTILE JOB EXECUTION
-
-// func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
-// 	if err := godotenv.Load("../.env"); err != nil {
-// 		t.Log(".env not found; using system environment variables")
-// 	}
-
-// 	// ctx, cancel := context.WithTimeout(
-// 	// 	context.Background(),
-// 	// 	5*time.Second,
-// 	// )
-// 	// defer cancel()
-
-// 	ctx, cancel := context.WithCancel(context.Background())
-// 	defer cancel()
-
-// 	pool, err := database.Connect(ctx)
-// 	if err != nil {
-// 		t.Fatalf("failed to connect to database: %v", err)
-// 	}
-// 	defer pool.Close()
-
-// 	testIDs := []int{2, 3}
-
-// 	for _, id := range testIDs {
-// 		_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", id)
-// 		if err != nil {
-// 			t.Fatalf("failed to prepare test job %d: %v", id, err)
-// 		}
-// 	}
-
-// 	defer func() {
-// 		for _, id := range testIDs {
-// 			_, _ = pool.Exec(
-// 				context.Background(),
-// 				"DELETE FROM jobs WHERE id = $1",
-// 				id,
-// 			)
-// 		}
-// 	}()
-
-// 	for _, id := range testIDs {
-// 		j, err := job.NewJob(id, "worker-loop-test")
-// 		if err != nil {
-// 			t.Fatal(err)
-// 		}
-
-// 		if err := database.SaveJob(ctx, pool, j); err != nil {
-// 			t.Fatalf("SaveJob failed for job %d: %v", id, err)
-// 		}
-// 	}
-
-// 	handler := &fakeHandler{}
-
-// 	w := &Worker{
-// 		Pool:    pool,
-// 		Handler: handler,
-// 	}
-
-// 	err = w.Run(ctx)
-// 	if err != nil {
-// 		t.Fatalf("Run failed: %v", err)
-// 	}
-
-// 	if handler.calls != 2 {
-// 		t.Fatalf("expected handler to be called twice, got %d", handler.calls)
-// 	}
-
-// 	for _, id := range testIDs {
-// 		saved, err := database.GetJob(ctx, pool, id)
-// 		if err != nil {
-// 			t.Fatalf("GetJob failed for job %d: %v", id, err)
-// 		}
-
-// 		if saved.Status != "Completed" {
-// 			t.Errorf(
-// 				"expected job %d status Completed, got %s",
-// 				id,
-// 				saved.Status,
-// 			)
-// 		}
-// 	}
-// }
 
 func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
 	if err := godotenv.Load("../.env"); err != nil {
@@ -623,7 +535,7 @@ func TestWorkerRecoversRetryAfterRestart(t *testing.T) {
 	defer pool.Close()
 
 	const testID = 987663
-
+	const fencingToken int64 = 0
 	_, err = pool.Exec(ctx,
 		"DELETE FROM jobs WHERE id = $1",
 		testID,
@@ -653,6 +565,7 @@ func TestWorkerRecoversRetryAfterRestart(t *testing.T) {
 		pool,
 		testID,
 		"Running",
+		fencingToken,
 	); err != nil {
 		t.Fatalf("failed to mark job Running: %v", err)
 	}
@@ -662,6 +575,7 @@ func TestWorkerRecoversRetryAfterRestart(t *testing.T) {
 		pool,
 		testID,
 		"Failed",
+		fencingToken,
 	); err != nil {
 		t.Fatalf("failed to mark job Failed: %v", err)
 	}
@@ -679,6 +593,7 @@ func TestWorkerRecoversRetryAfterRestart(t *testing.T) {
 		pool,
 		testID,
 		policy,
+		fencingToken,
 	); err != nil {
 		t.Fatalf("RetryJob failed: %v", err)
 	}
@@ -957,4 +872,375 @@ func TestTwoWorkersExecuteDifferentJobsConcurrently(t *testing.T) {
 	}
 
 	close(finished)
+}
+
+func TestWorkerHeartbeatRenewsLease(t *testing.T) {
+	ctx := context.Background()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	const jobID = 987665
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO jobs (
+			id,
+			name,
+			status,
+			retry_count,
+			max_retries,
+			worker_id,
+			lease_until,
+			fencing_token
+		)
+		VALUES ($1, 'heartbeat-test', 'Running', 0, 3, 'worker-heartbeat', NOW(), 1)
+	`, jobID)
+	if err != nil {
+		t.Fatalf("insert heartbeat test job: %v", err)
+	}
+	defer pool.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, jobID)
+
+	var before time.Time
+	err = pool.QueryRow(ctx,
+		`SELECT lease_until FROM jobs WHERE id = $1`,
+		jobID,
+	).Scan(&before)
+	if err != nil {
+		t.Fatalf("read initial lease: %v", err)
+	}
+
+	err = database.RenewJobLease(ctx, pool, jobID, 1)
+	if err != nil {
+		t.Fatalf("renew lease: %v", err)
+	}
+
+	var after time.Time
+	err = pool.QueryRow(ctx,
+		`SELECT lease_until FROM jobs WHERE id = $1`,
+		jobID,
+	).Scan(&after)
+	if err != nil {
+		t.Fatalf("read renewed lease: %v", err)
+	}
+
+	if !after.After(before) {
+		t.Fatalf(
+			"expected renewed lease to be later: before=%v after=%v",
+			before,
+			after,
+		)
+	}
+}
+
+func TestWorkerHeartbeatRenewsLeaseRepeatedly(t *testing.T) {
+
+	ctx := context.Background()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	const jobID = 987666
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO jobs (
+			id,
+			name,
+			status,
+			retry_count,
+			max_retries,
+			worker_id,
+			lease_until,
+			fencing_token
+		)
+		VALUES (
+			$1,
+			'heartbeat-loop-test',
+			'Running',
+			0,
+			3,
+			'heartbeat-worker',
+			NOW(),
+			1
+		)
+	`, jobID)
+	if err != nil {
+		t.Fatalf("insert heartbeat test job: %v", err)
+	}
+	defer pool.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, jobID)
+
+	w := &Worker{
+		WorkerID:          "heartbeat-worker",
+		Pool:              pool,
+		HeartbeatInterval: 50 * time.Millisecond,
+	}
+
+	var before time.Time
+	err = pool.QueryRow(
+		ctx,
+		`SELECT lease_until FROM jobs WHERE id = $1`,
+		jobID,
+	).Scan(&before)
+	if err != nil {
+		t.Fatalf("read initial lease: %v", err)
+	}
+
+	go w.heartbeat(ctx, jobID, 1)
+
+	time.Sleep(150 * time.Millisecond)
+
+	var after time.Time
+	err = pool.QueryRow(
+		ctx,
+		`SELECT lease_until FROM jobs WHERE id = $1`,
+		jobID,
+	).Scan(&after)
+	if err != nil {
+		t.Fatalf("read renewed lease: %v", err)
+	}
+
+	if !after.After(before) {
+		t.Fatalf(
+			"expected heartbeat to renew lease: before=%v after=%v",
+			before,
+			after,
+		)
+	}
+}
+
+func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	const jobID = 987667
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO jobs (
+			id,
+			name,
+			status,
+			retry_count,
+			max_retries,
+			worker_id,
+			lease_until,
+			fencing_token
+		)
+		VALUES (
+			$1,
+			'heartbeat-cancel-test',
+			'Running',
+			0,
+			3,
+			'heartbeat-worker',
+			NOW(),
+			1
+		)
+	`, jobID)
+	if err != nil {
+		t.Fatalf("insert heartbeat test job: %v", err)
+	}
+	defer pool.Exec(context.Background(),
+		`DELETE FROM jobs WHERE id = $1`,
+		jobID,
+	)
+
+	w := &Worker{
+		WorkerID:          "heartbeat-worker",
+		Pool:              pool,
+		HeartbeatInterval: 50 * time.Millisecond,
+	}
+
+	go w.heartbeat(ctx, jobID, 1)
+
+	time.Sleep(100 * time.Millisecond)
+
+	var beforeCancel time.Time
+	err = pool.QueryRow(
+		context.Background(),
+		`SELECT lease_until FROM jobs WHERE id = $1`,
+		jobID,
+	).Scan(&beforeCancel)
+	if err != nil {
+		t.Fatalf("read lease before cancellation: %v", err)
+	}
+
+	cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	var afterCancel time.Time
+	err = pool.QueryRow(
+		context.Background(),
+		`SELECT lease_until FROM jobs WHERE id = $1`,
+		jobID,
+	).Scan(&afterCancel)
+	if err != nil {
+		t.Fatalf("read lease after cancellation: %v", err)
+	}
+
+	if !afterCancel.Equal(beforeCancel) {
+		t.Fatalf(
+			"expected lease to stop renewing after cancellation: before=%v after=%v",
+			beforeCancel,
+			afterCancel,
+		)
+	}
+}
+
+type heartbeatOwnershipHandler struct {
+	started chan struct{}
+}
+
+func (h *heartbeatOwnershipHandler) Execute(
+	ctx context.Context,
+	j job.Job,
+) error {
+	close(h.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestWorkerStopsWhenHeartbeatLosesOwnership(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := database.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	const jobID = 987668
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO jobs (
+			id, name, status, retry_count, max_retries
+		)
+		VALUES ($1, 'heartbeat-loss-test', 'Pending', 0, 3)
+	`, jobID)
+	if err != nil {
+		t.Fatalf("insert test job: %v", err)
+	}
+
+	defer pool.Exec(
+		context.Background(),
+		`DELETE FROM jobs WHERE id = $1`,
+		jobID,
+	)
+
+	handler := &heartbeatOwnershipHandler{
+		started: make(chan struct{}),
+	}
+
+	w := &Worker{
+		WorkerID:          "worker-old-owner",
+		Pool:              pool,
+		Handler:           handler,
+		HeartbeatInterval: 50 * time.Millisecond,
+	}
+
+	type outcome struct {
+		processed bool
+		err       error
+	}
+
+	resultCh := make(chan outcome, 1)
+
+	go func() {
+		processed, runErr := w.RunOnce(ctx)
+		resultCh <- outcome{
+			processed: processed,
+			err:       runErr,
+		}
+	}()
+
+	// Wait until the old worker is executing the job.
+	select {
+	case <-handler.started:
+	case <-ctx.Done():
+		t.Fatal("handler did not start before timeout")
+	}
+
+	// Simulate a new owner taking over the job.
+	// Incrementing the token makes the old owner's token stale.
+	_, err = pool.Exec(ctx, `
+		UPDATE jobs
+		SET worker_id = 'worker-new-owner',
+		    fencing_token = fencing_token + 1,
+		    lease_until = NOW() + INTERVAL '30 seconds'
+		WHERE id = $1
+	`, jobID)
+	if err != nil {
+		t.Fatalf("simulate ownership takeover: %v", err)
+	}
+
+	// The old worker should detect the stale token via heartbeat.
+	select {
+	case result := <-resultCh:
+		if !result.processed {
+			t.Fatal("expected worker to have claimed the job")
+		}
+		if result.err == nil {
+			t.Fatal("expected heartbeat failure after ownership loss")
+		}
+
+	case <-ctx.Done():
+		t.Fatal("worker did not stop after losing ownership")
+	}
+
+	// Verify the old worker did not mark the job Completed.
+	var status string
+	var workerID string
+	var fencingToken int64
+
+	err = pool.QueryRow(ctx, `
+		SELECT status, worker_id, fencing_token
+		FROM jobs
+		WHERE id = $1
+	`, jobID).Scan(&status, &workerID, &fencingToken)
+	if err != nil {
+		t.Fatalf("read job after ownership loss: %v", err)
+	}
+
+	if status != "Running" {
+		t.Fatalf("expected status Running, got %q", status)
+	}
+
+	if workerID != "worker-new-owner" {
+		t.Fatalf("expected new owner to remain recorded, got %q", workerID)
+	}
+
+	if fencingToken != 2 {
+		t.Fatalf("expected fencing token 2, got %d", fencingToken)
+	}
 }
