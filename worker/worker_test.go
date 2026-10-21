@@ -1073,7 +1073,15 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 		HeartbeatInterval: 50 * time.Millisecond,
 	}
 
-	go w.heartbeat(ctx, jobID, 1)
+	// go w.heartbeat(ctx, jobID, 1)
+	// time.Sleep(100 * time.Millisecond)
+
+	heartbeatDone := make(chan struct{})
+
+	go func() {
+		defer close(heartbeatDone)
+		w.heartbeat(ctx, jobID, 1)
+	}()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -1087,9 +1095,18 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 		t.Fatalf("read lease before cancellation: %v", err)
 	}
 
+	// cancel()
+	// time.Sleep(150 * time.Millisecond)
+
 	cancel()
 
-	time.Sleep(150 * time.Millisecond)
+	select {
+	case <-heartbeatDone:
+	case <-time.After(1 * time.Second):
+		t.Fatal("heartbeat did not stop after cancellation")
+	}
+
+	time.Sleep(100 * time.Millisecond)
 
 	var afterCancel time.Time
 	err = pool.QueryRow(
