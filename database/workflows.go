@@ -67,13 +67,17 @@ func SaveTask(
 		ctx,
 		`INSERT INTO workflow_tasks (
 			id,
-			workflow_id,
-			name,
-			status
+    		workflow_id,
+    		job_id,
+    		name,
+    		status,
+    		created_at,
+    		updated_at
 		)
-		VALUES ($1, $2, $3, $4)`,
+		VALUES ($1, $2, $3, $4 , $5, NOW() , NOW())`,
 		t.ID,
 		t.WorkflowID,
+		t.JobID,
 		t.Name,
 		t.Status,
 	)

@@ -24,6 +24,7 @@ const (
 type Task struct {
 	ID         int64
 	WorkflowID int64
+	JobID      int64
 	Name       string
 	Status     TaskStatus
 }

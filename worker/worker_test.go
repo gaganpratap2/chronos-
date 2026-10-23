@@ -940,8 +940,8 @@ func TestWorkerHeartbeatRenewsLease(t *testing.T) {
 }
 
 func TestWorkerHeartbeatRenewsLeaseRepeatedly(t *testing.T) {
-
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	if err := godotenv.Load("../.env"); err != nil {
 		t.Fatalf("load .env: %v", err)
@@ -954,6 +954,14 @@ func TestWorkerHeartbeatRenewsLeaseRepeatedly(t *testing.T) {
 	defer pool.Close()
 
 	const jobID = 987666
+
+	_, err = pool.Exec(ctx, `
+		DELETE FROM jobs
+		WHERE id = $1
+	`, jobID)
+	if err != nil {
+		t.Fatalf("cleanup existing test job: %v", err)
+	}
 
 	_, err = pool.Exec(ctx, `
 		INSERT INTO jobs (
@@ -980,7 +988,12 @@ func TestWorkerHeartbeatRenewsLeaseRepeatedly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert heartbeat test job: %v", err)
 	}
-	defer pool.Exec(ctx, `DELETE FROM jobs WHERE id = $1`, jobID)
+
+	defer pool.Exec(
+		context.Background(),
+		`DELETE FROM jobs WHERE id = $1`,
+		jobID,
+	)
 
 	w := &Worker{
 		WorkerID:          "heartbeat-worker",
@@ -989,6 +1002,7 @@ func TestWorkerHeartbeatRenewsLeaseRepeatedly(t *testing.T) {
 	}
 
 	var before time.Time
+
 	err = pool.QueryRow(
 		ctx,
 		`SELECT lease_until FROM jobs WHERE id = $1`,
@@ -998,27 +1012,57 @@ func TestWorkerHeartbeatRenewsLeaseRepeatedly(t *testing.T) {
 		t.Fatalf("read initial lease: %v", err)
 	}
 
-	go w.heartbeat(ctx, jobID, 1)
+	heartbeatDone := make(chan struct{})
 
-	time.Sleep(150 * time.Millisecond)
+	go func() {
+		defer close(heartbeatDone)
+		w.heartbeat(ctx, jobID, 1)
+	}()
 
 	var after time.Time
-	err = pool.QueryRow(
-		ctx,
-		`SELECT lease_until FROM jobs WHERE id = $1`,
-		jobID,
-	).Scan(&after)
-	if err != nil {
-		t.Fatalf("read renewed lease: %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+
+	for time.Now().Before(deadline) {
+		err = pool.QueryRow(
+			ctx,
+			`SELECT lease_until
+			 FROM jobs
+			 WHERE id = $1`,
+			jobID,
+		).Scan(&after)
+
+		if err == nil && after.After(before) {
+			cancel()
+
+			select {
+			case <-heartbeatDone:
+			case <-time.After(1 * time.Second):
+				t.Fatal("heartbeat did not stop")
+			}
+
+			return
+		}
+
+		if err != nil {
+			t.Fatalf("read renewed lease: %v", err)
+		}
+
+		time.Sleep(20 * time.Millisecond)
 	}
 
-	if !after.After(before) {
-		t.Fatalf(
-			"expected heartbeat to renew lease: before=%v after=%v",
-			before,
-			after,
-		)
+	cancel()
+
+	select {
+	case <-heartbeatDone:
+	case <-time.After(1 * time.Second):
+		t.Fatal("heartbeat did not stop")
 	}
+
+	t.Fatalf(
+		"expected heartbeat to renew lease: before=%v after=%v",
+		before,
+		after,
+	)
 }
 
 func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
