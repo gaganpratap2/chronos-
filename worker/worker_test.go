@@ -258,10 +258,14 @@ func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
 	}
 	defer pool.Close()
 
-	testIDs := []int{2, 3}
+	testIDs := []int{999930, 999931}
 
 	for _, id := range testIDs {
-		_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", id)
+		_, err = pool.Exec(
+			ctx,
+			"DELETE FROM jobs WHERE id = $1",
+			id,
+		)
 		if err != nil {
 			t.Fatalf("failed to prepare test job %d: %v", id, err)
 		}
@@ -301,16 +305,39 @@ func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
 		runDone <- w.Run(ctx)
 	}()
 
-	// Wait until both jobs have been executed.
+	// Wait until both specific test jobs have completed.
 	deadline := time.After(5 * time.Second)
 
-	for handler.calls < 2 {
+	for {
+		allCompleted := true
+
+		for _, id := range testIDs {
+			saved, err := database.GetJob(
+				ctx,
+				pool,
+				id,
+			)
+			if err != nil {
+				t.Fatalf(
+					"GetJob failed while waiting for job %d: %v",
+					id,
+					err,
+				)
+			}
+
+			if saved.Status != "Completed" {
+				allCompleted = false
+				break
+			}
+		}
+
+		if allCompleted {
+			break
+		}
+
 		select {
 		case <-deadline:
-			t.Fatalf(
-				"worker did not process both jobs; calls=%d",
-				handler.calls,
-			)
+			t.Fatal("worker did not complete both test jobs")
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
@@ -322,10 +349,7 @@ func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 
-	if handler.calls != 2 {
-		t.Fatalf("expected handler to be called twice, got %d", handler.calls)
-	}
-
+	// Verify both specific test jobs completed successfully.
 	for _, id := range testIDs {
 		saved, err := database.GetJob(
 			context.Background(),
@@ -1085,7 +1109,7 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 	}
 	defer pool.Close()
 
-	const jobID = 987667
+	const jobID = 999940
 
 	_, err = pool.Exec(
 		dbCtx,

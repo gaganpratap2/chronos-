@@ -230,19 +230,28 @@ func (w *Worker) heartbeat(
 			return nil
 
 		case <-ticker.C:
-			// The ticker and cancellation can become ready
-			// at nearly the same time. Check cancellation
-			// again before touching the database.
+			// Cancellation may race with the ticker firing.
 			if ctx.Err() != nil {
 				return nil
 			}
 
+			renewCtx, cancel := context.WithCancel(ctx)
+
+			// Check once more before touching the database.
+			if renewCtx.Err() != nil {
+				cancel()
+				return nil
+			}
+
 			err := database.RenewJobLease(
-				ctx,
+				renewCtx,
 				w.Pool,
 				jobID,
 				fencingToken,
 			)
+
+			cancel()
+
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil

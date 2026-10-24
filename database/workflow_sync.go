@@ -67,17 +67,25 @@ func SyncTaskWithJob(ctx context.Context, pool *pgxpool.Pool, jobID int64) error
 
 	case "Completed":
 		if taskState == "Ready" || taskState == "Running" {
-			_, err = pool.Exec(
-				ctx,
-				`
-			UPDATE workflow_tasks
-			SET status = 'Completed',
-			    updated_at = NOW()
-			WHERE id = $1
-			  AND status IN ('Ready', 'Running')
-			`,
-				taskID,
-			)
+			result, updateErr := pool.Exec(ctx, `
+            UPDATE workflow_tasks
+            SET status = 'Completed',
+                updated_at = NOW()
+            WHERE id = $1
+        `, taskID)
+
+			if updateErr != nil {
+				err = updateErr
+				break
+			}
+
+			if result.RowsAffected() != 1 {
+				err = fmt.Errorf(
+					"expected to update task %d, affected %d rows",
+					taskID,
+					result.RowsAffected(),
+				)
+			}
 		}
 
 	case "Failed":
@@ -167,8 +175,6 @@ func SyncWorkflowTasksWithJobs(
 
 	return nil
 }
-
-
 
 func ReconcileWorkflow(
 	ctx context.Context,
