@@ -98,19 +98,26 @@ func GetTask(
 	id int64,
 ) (workflow.Task, error) {
 	var task workflow.Task
+	var jobID *int64
 
 	err := pool.QueryRow(
 		ctx,
-		`SELECT id, workflow_id, name, status
+		`SELECT id, workflow_id, job_id ,name, status
 		 FROM workflow_tasks
 		 WHERE id = $1`,
 		id,
 	).Scan(
 		&task.ID,
 		&task.WorkflowID,
+		&jobID,
 		&task.Name,
 		&task.Status,
 	)
+
+	if jobID != nil {
+		task.JobID = *jobID
+	}
+
 	if err != nil {
 		return workflow.Task{}, fmt.Errorf(
 			"get task %d: %w",

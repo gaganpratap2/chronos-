@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"chronos/database"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -37,5 +39,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 }
 
 func (s *Scheduler) RunOnce(ctx context.Context) error {
-	return nil
+	_, err := database.ClaimTaskAndCreateJob(
+		ctx, s.Pool,
+	)
+
+	return err
 }

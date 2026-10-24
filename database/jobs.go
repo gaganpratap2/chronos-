@@ -280,3 +280,27 @@ func RenewJobLease(ctx context.Context, pool *pgxpool.Pool, id int, fencingToken
 
 	return nil
 }
+
+func CreateExecutionJob(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	id int,
+	name string,
+) (job.Job, error) {
+	executionJob, err := job.NewJob(id, name)
+	if err != nil {
+		return job.Job{}, fmt.Errorf(
+			"create execution job: %w",
+			err,
+		)
+	}
+
+	if err := SaveJob(ctx, pool, executionJob); err != nil {
+		return job.Job{}, fmt.Errorf(
+			"save execution job: %w",
+			err,
+		)
+	}
+
+	return executionJob, nil
+}

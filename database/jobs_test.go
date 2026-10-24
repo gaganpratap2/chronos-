@@ -1075,3 +1075,163 @@ func TestRenewJobLeaseRejectsStaleFencingToken(t *testing.T) {
 		t.Fatal("expected stale fencing token to be rejected")
 	}
 }
+
+func TestCreateExecutionJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	const jobID = 998101
+
+	// Cleanup before the test.
+	_, err = pool.Exec(
+		ctx,
+		`DELETE FROM jobs WHERE id = $1`,
+		jobID,
+	)
+	if err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+
+	// Create the execution job.
+	createdJob, err := CreateExecutionJob(
+		ctx,
+		pool,
+		jobID,
+		"workflow-execution-test",
+	)
+	if err != nil {
+		t.Fatalf("create execution job: %v", err)
+	}
+
+	// Verify the returned job.
+	if createdJob.ID != jobID {
+		t.Fatalf(
+			"expected job ID %d, got %d",
+			jobID,
+			createdJob.ID,
+		)
+	}
+
+	if createdJob.Name != "workflow-execution-test" {
+		t.Fatalf(
+			"expected job name %q, got %q",
+			"workflow-execution-test",
+			createdJob.Name,
+		)
+	}
+
+	if createdJob.Status != "Pending" {
+		t.Fatalf(
+			"expected job status %q, got %q",
+			"Pending",
+			createdJob.Status,
+		)
+	}
+
+	if createdJob.RetryCount != 0 {
+		t.Fatalf(
+			"expected retry count 0, got %d",
+			createdJob.RetryCount,
+		)
+	}
+
+	if createdJob.MaxRetries != 3 {
+		t.Fatalf(
+			"expected max retries 3, got %d",
+			createdJob.MaxRetries,
+		)
+	}
+
+	if createdJob.NextRetryAt != nil {
+		t.Fatal("expected NextRetryAt to be nil")
+	}
+
+	// Verify that the job was actually persisted.
+	savedJob, err := GetJob(ctx, pool, jobID)
+	if err != nil {
+		t.Fatalf("get created job: %v", err)
+	}
+
+	if savedJob.ID != jobID {
+		t.Fatalf(
+			"expected saved job ID %d, got %d",
+			jobID,
+			savedJob.ID,
+		)
+	}
+
+	if savedJob.Name != "workflow-execution-test" {
+		t.Fatalf(
+			"expected saved job name %q, got %q",
+			"workflow-execution-test",
+			savedJob.Name,
+		)
+	}
+
+	if savedJob.Status != "Pending" {
+		t.Fatalf(
+			"expected saved job status %q, got %q",
+			"Pending",
+			savedJob.Status,
+		)
+	}
+
+	if savedJob.RetryCount != 0 {
+		t.Fatalf(
+			"expected saved retry count 0, got %d",
+			savedJob.RetryCount,
+		)
+	}
+
+	if savedJob.MaxRetries != 3 {
+		t.Fatalf(
+			"expected max retries 3, got %d",
+			savedJob.MaxRetries,
+		)
+	}
+
+	if savedJob.NextRetryAt != nil {
+		t.Fatal("expected saved NextRetryAt to be nil")
+	}
+
+	if savedJob.WorkerID != "" {
+		t.Fatalf(
+			"expected empty worker ID, got %q",
+			savedJob.WorkerID,
+		)
+	}
+
+	if savedJob.LeaseUntil != nil {
+		t.Fatal("expected LeaseUntil to be nil")
+	}
+
+	if savedJob.FencingToken != 0 {
+		t.Fatalf(
+			"expected fencing token 0, got %d",
+			savedJob.FencingToken,
+		)
+	}
+
+	// Cleanup after the test.
+	_, err = pool.Exec(
+		ctx,
+		`DELETE FROM jobs WHERE id = $1`,
+		jobID,
+	)
+	if err != nil {
+		t.Fatalf("cleanup after test: %v", err)
+	}
+}

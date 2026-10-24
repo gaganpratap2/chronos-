@@ -1066,14 +1066,20 @@ func TestWorkerHeartbeatRenewsLeaseRepeatedly(t *testing.T) {
 }
 
 func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
-
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	if err := godotenv.Load("../.env"); err != nil {
 		t.Fatalf("load .env: %v", err)
 	}
 
-	pool, err := database.Connect(ctx)
+	dbCtx, dbCancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer dbCancel()
+
+	pool, err := database.Connect(dbCtx)
 	if err != nil {
 		t.Fatalf("connect database: %v", err)
 	}
@@ -1081,7 +1087,18 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 
 	const jobID = 987667
 
-	_, err = pool.Exec(ctx, `
+	_, err = pool.Exec(
+		dbCtx,
+		`DELETE FROM jobs WHERE id = $1`,
+		jobID,
+	)
+	if err != nil {
+		t.Fatalf("clean test job: %v", err)
+	}
+
+	_, err = pool.Exec(
+		dbCtx,
+		`
 		INSERT INTO jobs (
 			id,
 			name,
@@ -1102,11 +1119,15 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 			NOW(),
 			1
 		)
-	`, jobID)
+		`,
+		jobID,
+	)
 	if err != nil {
 		t.Fatalf("insert heartbeat test job: %v", err)
 	}
-	defer pool.Exec(context.Background(),
+
+	defer pool.Exec(
+		context.Background(),
 		`DELETE FROM jobs WHERE id = $1`,
 		jobID,
 	)
@@ -1117,9 +1138,6 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 		HeartbeatInterval: 50 * time.Millisecond,
 	}
 
-	// go w.heartbeat(ctx, jobID, 1)
-	// time.Sleep(100 * time.Millisecond)
-
 	heartbeatDone := make(chan struct{})
 
 	go func() {
@@ -1127,21 +1145,10 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 		w.heartbeat(ctx, jobID, 1)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// Give the heartbeat enough time to perform at least one renewal.
+	time.Sleep(150 * time.Millisecond)
 
-	var beforeCancel time.Time
-	err = pool.QueryRow(
-		context.Background(),
-		`SELECT lease_until FROM jobs WHERE id = $1`,
-		jobID,
-	).Scan(&beforeCancel)
-	if err != nil {
-		t.Fatalf("read lease before cancellation: %v", err)
-	}
-
-	// cancel()
-	// time.Sleep(150 * time.Millisecond)
-
+	// Stop the heartbeat.
 	cancel()
 
 	select {
@@ -1150,23 +1157,37 @@ func TestWorkerHeartbeatStopsOnCancellation(t *testing.T) {
 		t.Fatal("heartbeat did not stop after cancellation")
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	// Take the snapshot only AFTER the heartbeat has completely stopped.
+	var afterStop time.Time
 
-	var afterCancel time.Time
 	err = pool.QueryRow(
-		context.Background(),
+		dbCtx,
 		`SELECT lease_until FROM jobs WHERE id = $1`,
 		jobID,
-	).Scan(&afterCancel)
+	).Scan(&afterStop)
 	if err != nil {
-		t.Fatalf("read lease after cancellation: %v", err)
+		t.Fatalf("read lease after heartbeat stopped: %v", err)
 	}
 
-	if !afterCancel.Equal(beforeCancel) {
+	// Wait longer than one heartbeat interval.
+	time.Sleep(150 * time.Millisecond)
+
+	var finalLease time.Time
+
+	err = pool.QueryRow(
+		dbCtx,
+		`SELECT lease_until FROM jobs WHERE id = $1`,
+		jobID,
+	).Scan(&finalLease)
+	if err != nil {
+		t.Fatalf("read final lease: %v", err)
+	}
+
+	if !finalLease.Equal(afterStop) {
 		t.Fatalf(
-			"expected lease to stop renewing after cancellation: before=%v after=%v",
-			beforeCancel,
-			afterCancel,
+			"lease changed after heartbeat stopped: stopped=%v final=%v",
+			afterStop,
+			finalLease,
 		)
 	}
 }

@@ -1054,3 +1054,107 @@ func TestGetWorkflowDependencies(t *testing.T) {
 		}
 	}
 }
+
+func TestSaveAndGetTaskWithJobID(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Logf("warning: .env not loaded: %v", err)
+	}
+
+	ctx := context.Background()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	const workflowID = int64(998001)
+	const taskID = int64(998001)
+	const jobID = int64(500001)
+
+	_, err = pool.Exec(
+		ctx,
+		`DELETE FROM workflows WHERE id = $1`,
+		workflowID,
+	)
+	if err != nil {
+		t.Fatalf("cleanup before test: %v", err)
+	}
+
+	w, err := workflow.NewWorkflow(
+		workflowID,
+		"job-link-test",
+	)
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+
+	if err := SaveWorkflow(ctx, pool, w); err != nil {
+		t.Fatalf("save workflow: %v", err)
+	}
+
+	task, err := workflow.NewTask(
+		taskID,
+		workflowID,
+		"execution-task",
+	)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	task.JobID = jobID
+
+	if err := SaveTask(ctx, pool, task); err != nil {
+		t.Fatalf("save task: %v", err)
+	}
+
+	got, err := GetTask(ctx, pool, taskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+
+	if got.ID != task.ID {
+		t.Fatalf("expected task ID %d, got %d", task.ID, got.ID)
+	}
+
+	if got.WorkflowID != task.WorkflowID {
+		t.Fatalf(
+			"expected workflow ID %d, got %d",
+			task.WorkflowID,
+			got.WorkflowID,
+		)
+	}
+
+	if got.JobID != jobID {
+		t.Fatalf(
+			"expected job ID %d, got %d",
+			jobID,
+			got.JobID,
+		)
+	}
+
+	if got.Name != task.Name {
+		t.Fatalf(
+			"expected task name %q, got %q",
+			task.Name,
+			got.Name,
+		)
+	}
+
+	if got.Status != task.Status {
+		t.Fatalf(
+			"expected task status %q, got %q",
+			task.Status,
+			got.Status,
+		)
+	}
+
+	_, err = pool.Exec(
+		ctx,
+		`DELETE FROM workflows WHERE id = $1`,
+		workflowID,
+	)
+	if err != nil {
+		t.Fatalf("cleanup after test: %v", err)
+	}
+}
