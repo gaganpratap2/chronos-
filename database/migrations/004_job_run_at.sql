@@ -1,0 +1,5 @@
+ALTER TABLE jobs
+ADD COLUMN run_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+CREATE INDEX idx_jobs_run_at
+ON jobs(run_at);

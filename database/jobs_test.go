@@ -13,9 +13,7 @@ import (
 
 func TestSaveAndGetJob(t *testing.T) {
 
-	// if err := godotenv.Load(); err != nil {
-	// 	t.Log(".env not found; using system environment variables")
-	// }
+	// runAt := time.Now().Truncate(time.Microsecond)
 
 	if err := godotenv.Load("../.env"); err != nil {
 		t.Log(".env not found; using system environment variables")
@@ -60,13 +58,31 @@ func TestSaveAndGetJob(t *testing.T) {
 		t.Fatalf("GetJob failed: %v", err)
 	}
 
-	if original.RetryCount != 2 {
-		t.Errorf("expected RetryCount 2, got %d", original.RetryCount)
+	if !retrieved.RunAt.Equal(original.RunAt.Truncate(time.Microsecond)) {
+		t.Fatalf(
+			"expected RunAt %v, got %v",
+			original.RunAt,
+			retrieved.RunAt,
+		)
 	}
 
-	if original.MaxRetries != 5 {
-		t.Errorf("expected MaxRetries 5, got %d", original.MaxRetries)
+	if retrieved.RetryCount != original.RetryCount {
+		t.Errorf("expected RetryCount %d, got %d",
+			original.RetryCount, retrieved.RetryCount)
 	}
+
+	if retrieved.MaxRetries != original.MaxRetries {
+		t.Errorf("expected MaxRetries %d, got %d",
+			original.MaxRetries, retrieved.MaxRetries)
+	}
+
+	// if original.RetryCount != 2 {
+	// 	t.Errorf("expected RetryCount 2, got %d", original.RetryCount)
+	// }
+
+	// if original.MaxRetries != 5 {
+	// 	t.Errorf("expected MaxRetries 5, got %d", original.MaxRetries)
+	// }
 
 	if retrieved.ID != original.ID {
 		t.Errorf("expected ID %d, got %d", original.ID, retrieved.ID)

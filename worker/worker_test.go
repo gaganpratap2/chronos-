@@ -121,6 +121,8 @@ func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	j.RunAt = time.Now().Add(-1 * time.Minute)
+
 	if err := database.SaveJob(ctx, pool, j); err != nil {
 		t.Fatalf("SaveJob failed: %v", err)
 	}

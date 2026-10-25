@@ -14,6 +14,7 @@ type Job struct {
 	ID           int
 	Name         string
 	Status       string
+	RunAt        time.Time
 	RetryCount   int
 	MaxRetries   int
 	NextRetryAt  *time.Time
@@ -42,6 +43,7 @@ func NewJob(id int, name string) (Job, error) {
 		ID:         id,
 		Name:       name,
 		Status:     "Pending",
+		RunAt:      time.Now(),
 		RetryCount: 0,
 		MaxRetries: 3,
 	}, nil

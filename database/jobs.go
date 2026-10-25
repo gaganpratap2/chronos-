@@ -13,9 +13,29 @@ import (
 // SaveJob stores a job in PostgreSQL.
 func SaveJob(ctx context.Context, pool *pgxpool.Pool, j job.Job) error {
 	_, err := pool.Exec(ctx,
-		`INSERT INTO jobs (id, name, status, retry_count, max_retries , next_retry_at)
-         VALUES ($1, $2, $3, $4, $5 , $6)`,
-		j.ID, j.Name, j.Status, j.RetryCount, j.MaxRetries, j.NextRetryAt,
+		`INSERT INTO jobs (
+			id,
+			name,
+			status,
+			run_at,
+			retry_count,
+			max_retries,
+			next_retry_at,
+			worker_id,
+			lease_until,
+			fencing_token
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		j.ID,
+		j.Name,
+		j.Status,
+		j.RunAt,
+		j.RetryCount,
+		j.MaxRetries,
+		j.NextRetryAt,
+		j.WorkerID,
+		j.LeaseUntil,
+		j.FencingToken,
 	)
 	if err != nil {
 		return fmt.Errorf("save job %d: %w", j.ID, err)
@@ -31,12 +51,15 @@ func GetJob(ctx context.Context, pool *pgxpool.Pool, id int) (job.Job, error) {
 	var workerID sql.NullString
 
 	err := pool.QueryRow(ctx,
-		`SELECT id, name, status, retry_count, max_retries , next_retry_at , worker_id ,lease_until , fencing_token
-        FROM jobs WHERE id = $1`,
+		`SELECT id, name, status, run_at, retry_count, max_retries, next_retry_at, worker_id, lease_until, fencing_token
+		FROM jobs
+		WHERE id = $1`,
 		id,
-	).Scan(&j.ID,
+	).Scan(
+		&j.ID,
 		&j.Name,
 		&j.Status,
+		&j.RunAt,
 		&j.RetryCount,
 		&j.MaxRetries,
 		&j.NextRetryAt,
@@ -204,22 +227,32 @@ func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool, workerID string) (job
 	var current job.Job
 
 	err = tx.QueryRow(ctx, `
-                    SELECT id , name , status , retry_count , max_retries , next_retry_at, fencing_token
-                    FROM jobs 
-                    WHERE 
-						(
-       						status = 'Pending'
-        					AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-    					)
-    					OR
-    					(
-        					status = 'Running'
-        					AND lease_until <= NOW()
-    					)
-                    ORDER BY id 
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED `,
-	).Scan(&current.ID,
+		SELECT
+			id,
+			name,
+			status,
+			retry_count,
+			max_retries,
+			next_retry_at,
+			fencing_token
+		FROM jobs
+		WHERE
+			(
+				status = 'Pending'
+				AND run_at <= NOW()
+				AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+			)
+			OR
+			(
+				status = 'Running'
+				AND lease_until <= NOW()
+			)
+		ORDER BY run_at, id
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED
+	`,
+	).Scan(
+		&current.ID,
 		&current.Name,
 		&current.Status,
 		&current.RetryCount,
@@ -239,14 +272,14 @@ func ClaimNextJob(ctx context.Context, pool *pgxpool.Pool, workerID string) (job
 	}
 
 	err = tx.QueryRow(ctx, `
-    UPDATE jobs
-    SET status = 'Running',
-        worker_id = $2,
-		lease_until = NOW() + INTERVAL '30 seconds',
-        fencing_token = fencing_token + 1
-    WHERE id = $1
-    RETURNING fencing_token
-`, current.ID, workerID).Scan(&current.FencingToken)
+		UPDATE jobs
+		SET status = 'Running',
+			worker_id = $2,
+			lease_until = NOW() + INTERVAL '30 seconds',
+			fencing_token = fencing_token + 1
+		WHERE id = $1
+		RETURNING fencing_token
+	`, current.ID, workerID).Scan(&current.FencingToken)
 
 	if err != nil {
 		return job.Job{}, fmt.Errorf("update claimed job: %w", err)

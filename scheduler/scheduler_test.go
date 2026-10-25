@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -195,5 +196,108 @@ func TestSchedulerRunOnceDispatchesTask(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("cleanup workflow: %v", err)
+	}
+}
+
+func TestSchedulerStopsOnContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &Scheduler{
+		PollInterval: 10 * time.Millisecond,
+	}
+
+	cancel()
+
+	err := s.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestSchedulerStopsWhileRunning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := &Scheduler{
+		PollInterval: time.Hour,
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- s.Run(ctx)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop after context cancellation")
+	}
+}
+
+func TestSchedulerRunsOnTick(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	called := make(chan struct{}, 1)
+
+	s := &Scheduler{
+		PollInterval: 10 * time.Millisecond,
+		RunOnceFunc: func(ctx context.Context) error {
+			called <- struct{}{}
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- s.Run(ctx)
+	}()
+
+	select {
+	case <-called:
+		cancel()
+
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not run on tick")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop after cancellation")
+	}
+}
+
+func TestSchedulerPropagatesRunOnceError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	expectedErr := errors.New("scheduler failure")
+
+	s := &Scheduler{
+		PollInterval: 10 * time.Millisecond,
+		RunOnceFunc: func(ctx context.Context) error {
+			return expectedErr
+		},
+	}
+
+	err := s.Run(ctx)
+
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected %v, got %v", expectedErr, err)
 	}
 }

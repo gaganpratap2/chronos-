@@ -12,6 +12,7 @@ import (
 type Scheduler struct {
 	Pool         *pgxpool.Pool
 	PollInterval time.Duration
+	RunOnceFunc  func(context.Context) error
 }
 
 func New(pool *pgxpool.Pool) *Scheduler {
@@ -22,7 +23,12 @@ func New(pool *pgxpool.Pool) *Scheduler {
 }
 
 func (s *Scheduler) Run(ctx context.Context) error {
-	ticker := time.NewTicker(s.PollInterval)
+	interval := s.PollInterval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -31,7 +37,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			return ctx.Err()
 
 		case <-ticker.C:
-			if err := s.RunOnce(ctx); err != nil {
+			runOnce := s.RunOnce
+			if s.RunOnceFunc != nil {
+				runOnce = s.RunOnceFunc
+			}
+
+			if err := runOnce(ctx); err != nil {
 				return err
 			}
 		}
@@ -40,7 +51,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 func (s *Scheduler) RunOnce(ctx context.Context) error {
 	_, err := database.ClaimTaskAndCreateJob(
-		ctx, s.Pool,
+		ctx,
+		s.Pool,
 	)
 
 	return err
