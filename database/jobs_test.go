@@ -141,6 +141,8 @@ func TestRetryJob(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	beforeRetry := time.Now()
+
 	got, err := RetryJob(
 		ctx,
 		pool,
@@ -188,10 +190,12 @@ func TestRetryJob(t *testing.T) {
 		t.Fatal("expected saved NextRetryAt to be set")
 	}
 
-	remaining := time.Until(got.NextRetryAt.UTC())
+	// remaining := time.Until(got.NextRetryAt.UTC())
 
-	if remaining < 800*time.Millisecond || remaining > 1200*time.Millisecond {
-		t.Fatalf("expected retry delay around 1s, got %v", remaining)
+	delay := got.NextRetryAt.Sub(beforeRetry)
+
+	if delay < 800*time.Millisecond || delay > 1200*time.Millisecond {
+		t.Fatalf("expected retry delay around 1s, got %v", delay)
 	}
 }
 
