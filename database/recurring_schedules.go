@@ -16,19 +16,42 @@ func SaveRecurringSchedule(
 	pool *pgxpool.Pool,
 	s schedule.RecurringSchedule,
 ) error {
+	scheduleType := s.Type
+
+	if scheduleType == "" {
+		scheduleType = schedule.ScheduleInterval
+	}
+
+	var cronExpression *string
+	var timezone *string
+
+	if s.CronExpression != "" {
+		cronExpression = &s.CronExpression
+	}
+
+	if s.Timezone != "" {
+		timezone = &s.Timezone
+	}
+
 	_, err := pool.Exec(ctx, `
 		INSERT INTO recurring_schedules (
 			name,
+			schedule_type,
 			interval_seconds,
+			cron_expression,
+			timezone,
 			next_run_at,
 			enabled,
 			catch_up_policy,
 			max_catch_up
 		)
-		VALUES ($1, $2, $3, $4 , $5 , $6)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`,
 		s.Name,
+		scheduleType,
 		int64(s.Interval.Seconds()),
+		cronExpression,
+		timezone,
 		s.NextRunAt,
 		s.Enabled,
 		s.CatchUpPolicy,
@@ -42,16 +65,24 @@ func SaveRecurringSchedule(
 	return nil
 }
 
-func GetRecurringSchedule(ctx context.Context, pool *pgxpool.Pool, id int64) (schedule.RecurringSchedule, error) {
-
+func GetRecurringSchedule(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	id int64,
+) (schedule.RecurringSchedule, error) {
 	var s schedule.RecurringSchedule
 	var intervalSeconds int64
+	var cronExpression *string
+	var timezone *string
 
 	err := pool.QueryRow(ctx, `
 		SELECT
 			id,
 			name,
+			schedule_type,
 			interval_seconds,
+			cron_expression,
+			timezone,
 			next_run_at,
 			enabled,
 			catch_up_policy,
@@ -61,7 +92,10 @@ func GetRecurringSchedule(ctx context.Context, pool *pgxpool.Pool, id int64) (sc
 	`, id).Scan(
 		&s.ID,
 		&s.Name,
+		&s.Type,
 		&intervalSeconds,
+		&cronExpression,
+		&timezone,
 		&s.NextRunAt,
 		&s.Enabled,
 		&s.CatchUpPolicy,
@@ -77,6 +111,14 @@ func GetRecurringSchedule(ctx context.Context, pool *pgxpool.Pool, id int64) (sc
 	}
 
 	s.Interval = time.Duration(intervalSeconds) * time.Second
+
+	if cronExpression != nil {
+		s.CronExpression = *cronExpression
+	}
+
+	if timezone != nil {
+		s.Timezone = *timezone
+	}
 
 	return s, nil
 }
@@ -99,27 +141,37 @@ func ClaimRecurringSchedule(
 	var s schedule.RecurringSchedule
 	var intervalSeconds int64
 
+	var cronExpression *string
+	var timezone *string
+
 	err = tx.QueryRow(ctx, `
-		SELECT
-			id,
-			name,
-			interval_seconds,
-			next_run_at,
-			enabled,
-			catch_up_policy,
-			max_catch_up
-		FROM recurring_schedules
-		WHERE id = $1
-		FOR UPDATE
-	`, id).Scan(
+	SELECT
+		id,
+		name,
+		schedule_type,
+		interval_seconds,
+		cron_expression,
+		timezone,
+		next_run_at,
+		enabled,
+		catch_up_policy,
+		max_catch_up
+	FROM recurring_schedules
+	WHERE id = $1
+	FOR UPDATE
+`, id).Scan(
 		&s.ID,
 		&s.Name,
+		&s.Type,
 		&intervalSeconds,
+		&cronExpression,
+		&timezone,
 		&s.NextRunAt,
 		&s.Enabled,
 		&s.CatchUpPolicy,
 		&s.MaxCatchUp,
 	)
+
 	if err != nil {
 		return schedule.RecurringSchedule{}, nil, fmt.Errorf(
 			"lock recurring schedule %d: %w",
@@ -128,17 +180,15 @@ func ClaimRecurringSchedule(
 		)
 	}
 
-	s.Interval = time.Duration(intervalSeconds) * time.Second
+	if cronExpression != nil {
+		s.CronExpression = *cronExpression
+	}
 
-	fmt.Printf(
-		"DEBUG ClaimRecurringSchedule: id=%d next_run_at=%v interval=%v policy=%q max_catch_up=%d now=%v\n",
-		s.ID,
-		s.NextRunAt,
-		s.Interval,
-		s.CatchUpPolicy,
-		s.MaxCatchUp,
-		time.Now(),
-	)
+	if timezone != nil {
+		s.Timezone = *timezone
+	}
+
+	s.Interval = time.Duration(intervalSeconds) * time.Second
 
 	if !s.Enabled {
 		return schedule.RecurringSchedule{}, nil, fmt.Errorf(
@@ -149,16 +199,50 @@ func ClaimRecurringSchedule(
 
 	now := time.Now()
 
-	result := schedule.CalculateCatchUp(
-		s.NextRunAt,
-		s.Interval,
-		now,
-		s.CatchUpPolicy,
-		s.MaxCatchUp,
-	)
+	var occurrences []time.Time
+	var nextRunAt time.Time
 
-	if len(result.Occurrences) == 0 {
-		if result.NextRunAt.Equal(s.NextRunAt) {
+	switch s.Type {
+	case schedule.ScheduleInterval:
+		result := schedule.CalculateCatchUp(
+			s.NextRunAt,
+			s.Interval,
+			now,
+			s.CatchUpPolicy,
+			s.MaxCatchUp,
+		)
+
+		occurrences = result.Occurrences
+		nextRunAt = result.NextRunAt
+
+	case schedule.ScheduleCron:
+		result, err := schedule.CalculateCronCatchUp(
+			s.CronExpression,
+			s.Timezone,
+			s.NextRunAt,
+			now,
+			s.CatchUpPolicy,
+			s.MaxCatchUp,
+		)
+		if err != nil {
+			return schedule.RecurringSchedule{}, nil, fmt.Errorf(
+				"calculate cron catch-up: %w",
+				err,
+			)
+		}
+
+		occurrences = result.Occurrences
+		nextRunAt = result.NextRunAt
+
+	default:
+		return schedule.RecurringSchedule{}, nil, fmt.Errorf(
+			"unsupported schedule type: %q",
+			s.Type,
+		)
+	}
+
+	if len(occurrences) == 0 {
+		if nextRunAt.Equal(s.NextRunAt) {
 			return schedule.RecurringSchedule{}, nil, fmt.Errorf(
 				"recurring schedule %d is not due",
 				id,
@@ -171,7 +255,7 @@ func ClaimRecurringSchedule(
 			WHERE id = $1
 		`,
 			id,
-			result.NextRunAt,
+			nextRunAt,
 		)
 		if err != nil {
 			return schedule.RecurringSchedule{}, nil, fmt.Errorf(
@@ -181,7 +265,7 @@ func ClaimRecurringSchedule(
 			)
 		}
 
-		s.NextRunAt = result.NextRunAt
+		s.NextRunAt = nextRunAt
 
 		if err := tx.Commit(ctx); err != nil {
 			return schedule.RecurringSchedule{}, nil, fmt.Errorf(
@@ -193,9 +277,9 @@ func ClaimRecurringSchedule(
 		return s, nil, nil
 	}
 
-	createdJobs := make([]job.Job, 0, len(result.Occurrences))
+	createdJobs := make([]job.Job, 0, len(occurrences))
 
-	for _, occurrence := range result.Occurrences {
+	for _, occurrence := range occurrences {
 		jobName := fmt.Sprintf(
 			"%s-%s",
 			s.Name,
@@ -246,7 +330,7 @@ func ClaimRecurringSchedule(
 		WHERE id = $1
 	`,
 		id,
-		result.NextRunAt,
+		nextRunAt,
 	)
 	if err != nil {
 		return schedule.RecurringSchedule{}, nil, fmt.Errorf(
@@ -256,7 +340,7 @@ func ClaimRecurringSchedule(
 		)
 	}
 
-	s.NextRunAt = result.NextRunAt
+	s.NextRunAt = nextRunAt
 
 	if err := tx.Commit(ctx); err != nil {
 		return schedule.RecurringSchedule{}, nil, fmt.Errorf(

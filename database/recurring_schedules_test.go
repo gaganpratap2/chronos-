@@ -600,3 +600,166 @@ func TestClaimRecurringScheduleFireAll(t *testing.T) {
 		)
 	}
 }
+func TestSaveAndGetCronSchedule(t *testing.T) {
+	ctx := context.Background()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	s, err := schedule.NewCronSchedule(
+		"daily-report",
+		"0 9 * * *",
+		"Asia/Kolkata",
+		time.Date(
+			2026,
+			10,
+			26,
+			9,
+			0,
+			0,
+			0,
+			time.FixedZone("IST", 5*60*60+30*60),
+		),
+	)
+	if err != nil {
+		t.Fatalf("create cron schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, s); err != nil {
+		t.Fatalf("save cron schedule: %v", err)
+	}
+
+	got, err := GetRecurringSchedule(ctx, pool, s.ID)
+	if err != nil {
+		t.Fatalf("get cron schedule: %v", err)
+	}
+
+	if got.Type != s.Type {
+		t.Fatalf("expected type %q, got %q", s.Type, got.Type)
+	}
+
+	if got.CronExpression != "0 9 * * *" {
+		t.Fatalf("expected cron expression %q, got %q",
+			"0 9 * * *", got.CronExpression)
+	}
+
+	if got.Timezone != "Asia/Kolkata" {
+		t.Fatalf("expected timezone %q, got %q",
+			"Asia/Kolkata", got.Timezone)
+	}
+
+	if !got.NextRunAt.Equal(s.NextRunAt) {
+		t.Fatalf("expected next_run_at %v, got %v",
+			s.NextRunAt, got.NextRunAt)
+	}
+}
+
+func TestClaimRecurringScheduleCronFireAll(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	loc, err := time.LoadLocation("Asia/Kolkata")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextRunAt := time.Date(
+		2026, 10, 23, 9, 0, 0, 0, loc,
+	)
+
+	// now := time.Date(
+	// 	2026, 10, 26, 11, 0, 0, 0, loc,
+	// )
+
+	s, err := schedule.NewCronSchedule(
+		"cron-report",
+		"0 9 * * *",
+		"Asia/Kolkata",
+		nextRunAt,
+	)
+	if err != nil {
+		t.Fatalf("create cron schedule: %v", err)
+	}
+
+	s.CatchUpPolicy = schedule.CatchUpFireAll
+	s.MaxCatchUp = 10
+
+	if err := SaveRecurringSchedule(ctx, pool, s); err != nil {
+		t.Fatalf("save cron schedule: %v", err)
+	}
+
+	var scheduleID int64
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id
+	 FROM recurring_schedules
+	 WHERE name = $1
+	 ORDER BY id DESC
+	 LIMIT 1`,
+		s.Name,
+	).Scan(&scheduleID)
+
+	if err != nil {
+		t.Fatalf("get saved cron schedule ID: %v", err)
+	}
+
+	claimed, jobs, err := ClaimRecurringSchedule(
+		ctx,
+		pool,
+		scheduleID,
+	)
+	if err != nil {
+		t.Fatalf("claim cron schedule: %v", err)
+	}
+
+	if len(jobs) != 4 {
+		t.Fatalf("expected 4 jobs, got %d", len(jobs))
+	}
+
+	expectedRuns := []time.Time{
+		time.Date(2026, 10, 23, 9, 0, 0, 0, loc),
+		time.Date(2026, 10, 24, 9, 0, 0, 0, loc),
+		time.Date(2026, 10, 25, 9, 0, 0, 0, loc),
+		time.Date(2026, 10, 26, 9, 0, 0, 0, loc),
+	}
+
+	for i, expected := range expectedRuns {
+		if !jobs[i].RunAt.Equal(expected) {
+			t.Fatalf(
+				"job %d: expected RunAt %v, got %v",
+				i,
+				expected,
+				jobs[i].RunAt,
+			)
+		}
+	}
+
+	expectedNext := time.Date(
+		2026, 10, 27, 9, 0, 0, 0, loc,
+	)
+
+	if !claimed.NextRunAt.Equal(expectedNext) {
+		t.Fatalf(
+			"expected next_run_at %v, got %v",
+			expectedNext,
+			claimed.NextRunAt,
+		)
+	}
+}

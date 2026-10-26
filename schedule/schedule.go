@@ -1,18 +1,31 @@
 package schedule
 
 import (
-	"errors"
+	// "errors"
+	"fmt"
 	"time"
+
+	"github.com/robfig/cron/v3"
+)
+
+type ScheduleType string
+
+const (
+	ScheduleInterval ScheduleType = "interval"
+	ScheduleCron     ScheduleType = "cron"
 )
 
 type RecurringSchedule struct {
-	ID            int64
-	Name          string
-	Interval      time.Duration
-	NextRunAt     time.Time
-	Enabled       bool
-	CatchUpPolicy CatchUpPolicy
-	MaxCatchUp    int
+	ID             int64
+	Name           string
+	Type           ScheduleType
+	Interval       time.Duration
+	CronExpression string
+	Timezone       string
+	NextRunAt      time.Time
+	Enabled        bool
+	CatchUpPolicy  CatchUpPolicy
+	MaxCatchUp     int
 }
 
 type CatchUpPolicy string
@@ -29,23 +42,85 @@ func NewRecurringSchedule(
 	nextRunAt time.Time,
 ) (RecurringSchedule, error) {
 	if name == "" {
-		return RecurringSchedule{}, errors.New("schedule name cannot be empty")
+		return RecurringSchedule{}, fmt.Errorf("name cannot be empty")
 	}
 
 	if interval <= 0 {
-		return RecurringSchedule{}, errors.New("schedule interval must be greater than zero")
+		return RecurringSchedule{}, fmt.Errorf("interval must be positive")
 	}
 
 	if nextRunAt.IsZero() {
-		return RecurringSchedule{}, errors.New("next run time cannot be zero")
+		return RecurringSchedule{}, fmt.Errorf("next run time cannot be zero")
 	}
 
 	return RecurringSchedule{
 		Name:          name,
+		Type:          ScheduleInterval,
 		Interval:      interval,
 		NextRunAt:     nextRunAt,
 		Enabled:       true,
 		CatchUpPolicy: CatchUpSkip,
 		MaxCatchUp:    100,
 	}, nil
+}
+
+func NewCronSchedule(
+	name string,
+	expression string,
+	timezone string,
+	nextRunAt time.Time,
+) (RecurringSchedule, error) {
+	if name == "" {
+		return RecurringSchedule{}, fmt.Errorf("name cannot be empty")
+	}
+
+	if expression == "" {
+		return RecurringSchedule{}, fmt.Errorf("cron expression cannot be empty")
+	}
+
+	if timezone == "" {
+		return RecurringSchedule{}, fmt.Errorf("timezone cannot be empty")
+	}
+
+	if nextRunAt.IsZero() {
+		return RecurringSchedule{}, fmt.Errorf("next run time cannot be zero")
+	}
+
+	if err := ValidateCronSchedule(expression, timezone); err != nil {
+		return RecurringSchedule{}, err
+	}
+
+	return RecurringSchedule{
+		Name:           name,
+		Type:           ScheduleCron,
+		CronExpression: expression,
+		Timezone:       timezone,
+		NextRunAt:      nextRunAt,
+		Enabled:        true,
+		CatchUpPolicy:  CatchUpSkip,
+		MaxCatchUp:     100,
+	}, nil
+}
+
+func ValidateCronSchedule(
+	expression string,
+	timezone string,
+) error {
+	if expression == "" {
+		return fmt.Errorf("cron expression cannot be empty")
+	}
+
+	if timezone == "" {
+		return fmt.Errorf("timezone cannot be empty")
+	}
+
+	if _, err := cron.ParseStandard(expression); err != nil {
+		return fmt.Errorf("invalid cron expression: %w", err)
+	}
+
+	if _, err := time.LoadLocation(timezone); err != nil {
+		return fmt.Errorf("invalid timezone: %w", err)
+	}
+
+	return nil
 }
