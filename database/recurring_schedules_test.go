@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ func TestSaveAndGetRecurringSchedule(t *testing.T) {
 		interval,
 		nextRunAt,
 	)
+	// t.Logf("CatchUpPolicy = %q", original.CatchUpPolicy)
 	if err != nil {
 		t.Fatalf("create schedule: %v", err)
 	}
@@ -91,6 +93,14 @@ func TestSaveAndGetRecurringSchedule(t *testing.T) {
 			retrieved.Enabled,
 		)
 	}
+
+	if retrieved.CatchUpPolicy != original.CatchUpPolicy {
+		t.Fatalf(
+			"expected CatchUpPolicy %q, got %q",
+			original.CatchUpPolicy,
+			retrieved.CatchUpPolicy,
+		)
+	}
 }
 
 func TestClaimRecurringScheduleConcurrent(t *testing.T) {
@@ -118,6 +128,7 @@ func TestClaimRecurringScheduleConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.CatchUpPolicy = schedule.CatchUpFireOnce
 
 	if err := SaveRecurringSchedule(ctx, pool, s); err != nil {
 		t.Fatal(err)
@@ -159,15 +170,31 @@ func TestClaimRecurringScheduleConcurrent(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		go func() {
-			_, createdJob, err := ClaimRecurringSchedule(
+			_, createdJobs, err := ClaimRecurringSchedule(
 				ctx,
 				pool,
 				s.ID,
 			)
 
+			if err != nil {
+				results <- result{
+					err: err,
+				}
+				return
+			}
+
+			if len(createdJobs) != 1 {
+				results <- result{
+					err: fmt.Errorf(
+						"expected 1 created job, got %d",
+						len(createdJobs),
+					),
+				}
+				return
+			}
+
 			results <- result{
-				job: createdJob,
-				err: err,
+				job: createdJobs[0],
 			}
 		}()
 	}
@@ -181,6 +208,8 @@ func TestClaimRecurringScheduleConcurrent(t *testing.T) {
 		if r.err == nil {
 			successes++
 			createdJobs = append(createdJobs, r.job)
+		} else {
+			t.Logf("claim attempt failed: %v", r.err)
 		}
 	}
 
@@ -207,6 +236,367 @@ func TestClaimRecurringScheduleConcurrent(t *testing.T) {
 		t.Fatalf(
 			"expected exactly 1 recurring job, got %d",
 			count,
+		)
+	}
+}
+
+func TestClaimRecurringScheduleFireOnce(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	start := time.Now().Add(-16 * time.Minute)
+
+	s, err := schedule.NewRecurringSchedule(
+		"fire-once-test",
+		5*time.Minute,
+		start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.CatchUpPolicy = schedule.CatchUpFireOnce
+
+	if err := SaveRecurringSchedule(ctx, pool, s); err != nil {
+		t.Fatal(err)
+	}
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id
+		 FROM recurring_schedules
+		 WHERE name = $1
+		 ORDER BY id DESC
+		 LIMIT 1`,
+		s.Name,
+	).Scan(&s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		_, _ = pool.Exec(
+			ctx,
+			`DELETE FROM jobs
+			 WHERE name LIKE 'fire-once-test-%'`,
+		)
+
+		_, _ = pool.Exec(
+			ctx,
+			`DELETE FROM recurring_schedules
+			 WHERE id = $1`,
+			s.ID,
+		)
+	}()
+
+	_, createdJobs, err := ClaimRecurringSchedule(
+		ctx,
+		pool,
+		s.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(createdJobs) != 1 {
+		t.Fatalf(
+			"expected 1 created job, got %d",
+			len(createdJobs),
+		)
+	}
+
+	if !createdJobs[0].RunAt.Equal(start.Truncate(time.Microsecond)) {
+		t.Fatalf(
+			"expected RunAt %v, got %v",
+			start,
+			createdJobs[0].RunAt,
+		)
+	}
+
+	var nextRunAt time.Time
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT next_run_at
+		 FROM recurring_schedules
+		 WHERE id = $1`,
+		s.ID,
+	).Scan(&nextRunAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedNextRun := start.Add(20 * time.Minute)
+
+	if !nextRunAt.Equal(expectedNextRun.Truncate(time.Microsecond)) {
+		t.Fatalf(
+			"expected next_run_at %v, got %v",
+			expectedNextRun,
+			nextRunAt,
+		)
+	}
+}
+
+func TestClaimRecurringScheduleSkip(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	start := time.Now().Add(-16 * time.Minute)
+
+	s, err := schedule.NewRecurringSchedule(
+		"skip-test",
+		5*time.Minute,
+		start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.CatchUpPolicy = schedule.CatchUpSkip
+
+	if err := SaveRecurringSchedule(ctx, pool, s); err != nil {
+		t.Fatal(err)
+	}
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id
+		 FROM recurring_schedules
+		 WHERE name = $1
+		 ORDER BY id DESC
+		 LIMIT 1`,
+		s.Name,
+	).Scan(&s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() {
+		_, _ = pool.Exec(
+			ctx,
+			`DELETE FROM jobs
+			 WHERE name LIKE 'skip-test-%'`,
+		)
+
+		_, _ = pool.Exec(
+			ctx,
+			`DELETE FROM recurring_schedules
+			 WHERE id = $1`,
+			s.ID,
+		)
+	}()
+
+	_, createdJobs, err := ClaimRecurringSchedule(
+		ctx,
+		pool,
+		s.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(createdJobs) != 0 {
+		t.Fatalf(
+			"expected 0 created jobs, got %d",
+			len(createdJobs),
+		)
+	}
+
+	var nextRunAt time.Time
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT next_run_at
+		 FROM recurring_schedules
+		 WHERE id = $1`,
+		s.ID,
+	).Scan(&nextRunAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedNextRun := start.Add(20 * time.Minute)
+
+	if !nextRunAt.Equal(expectedNextRun.Truncate(time.Microsecond)) {
+		t.Fatalf(
+			"expected next_run_at %v, got %v",
+			expectedNextRun,
+			nextRunAt,
+		)
+	}
+}
+
+func TestClaimRecurringScheduleFireAll(t *testing.T) {
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	start := time.Now().Add(-26 * time.Minute)
+
+	s, err := schedule.NewRecurringSchedule(
+		"fire-all-test",
+		5*time.Minute,
+		start,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.CatchUpPolicy = schedule.CatchUpFireAll
+	s.MaxCatchUp = 3
+
+	if err := SaveRecurringSchedule(ctx, pool, s); err != nil {
+		t.Fatal(err)
+	}
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id
+		 FROM recurring_schedules
+		 WHERE name = $1
+		 ORDER BY id DESC
+		 LIMIT 1`,
+		s.Name,
+	).Scan(&s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var storedNextRunAt time.Time
+	var storedPolicy string
+	var storedMaxCatchUp int
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT next_run_at, catch_up_policy, max_catch_up
+	 FROM recurring_schedules
+	 WHERE id = $1`,
+		s.ID,
+	).Scan(
+		&storedNextRunAt,
+		&storedPolicy,
+		&storedMaxCatchUp,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf(
+		"stored: next_run_at=%v policy=%q max_catch_up=%d now=%v",
+		storedNextRunAt,
+		storedPolicy,
+		storedMaxCatchUp,
+		time.Now(),
+	)
+
+	defer func() {
+		_, _ = pool.Exec(
+			ctx,
+			`DELETE FROM jobs
+			 WHERE name LIKE 'fire-all-test-%'`,
+		)
+
+		_, _ = pool.Exec(
+			ctx,
+			`DELETE FROM recurring_schedules
+			 WHERE id = $1`,
+			s.ID,
+		)
+	}()
+
+	_, createdJobs, err := ClaimRecurringSchedule(
+		ctx,
+		pool,
+		s.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(createdJobs) != 3 {
+		t.Fatalf(
+			"expected 3 created jobs, got %d",
+			len(createdJobs),
+		)
+	}
+
+	expectedRunTimes := []time.Time{
+		start,
+		start.Add(5 * time.Minute),
+		start.Add(10 * time.Minute),
+	}
+
+	for i, createdJob := range createdJobs {
+		expected := expectedRunTimes[i].Truncate(time.Microsecond)
+
+		if !createdJob.RunAt.Equal(expected) {
+			t.Fatalf(
+				"job %d: expected RunAt %v, got %v",
+				i,
+				expected,
+				createdJob.RunAt,
+			)
+		}
+	}
+
+	var nextRunAt time.Time
+
+	err = pool.QueryRow(
+		ctx,
+		`SELECT next_run_at
+		 FROM recurring_schedules
+		 WHERE id = $1`,
+		s.ID,
+	).Scan(&nextRunAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedNextRun := start.Add(15 * time.Minute)
+
+	if !nextRunAt.Equal(expectedNextRun.Truncate(time.Microsecond)) {
+		t.Fatalf(
+			"expected next_run_at %v, got %v",
+			expectedNextRun,
+			nextRunAt,
 		)
 	}
 }

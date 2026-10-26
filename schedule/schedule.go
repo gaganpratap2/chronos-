@@ -6,12 +6,22 @@ import (
 )
 
 type RecurringSchedule struct {
-	ID        int64
-	Name      string
-	Interval  time.Duration
-	NextRunAt time.Time
-	Enabled   bool
+	ID            int64
+	Name          string
+	Interval      time.Duration
+	NextRunAt     time.Time
+	Enabled       bool
+	CatchUpPolicy CatchUpPolicy
+	MaxCatchUp    int
 }
+
+type CatchUpPolicy string
+
+const (
+	CatchUpFireAll  CatchUpPolicy = "fire_all"
+	CatchUpFireOnce CatchUpPolicy = "fire_once"
+	CatchUpSkip     CatchUpPolicy = "skip"
+)
 
 func NewRecurringSchedule(
 	name string,
@@ -31,9 +41,11 @@ func NewRecurringSchedule(
 	}
 
 	return RecurringSchedule{
-		Name:      name,
-		Interval:  interval,
-		NextRunAt: nextRunAt,
-		Enabled:   true,
+		Name:          name,
+		Interval:      interval,
+		NextRunAt:     nextRunAt,
+		Enabled:       true,
+		CatchUpPolicy: CatchUpSkip,
+		MaxCatchUp:    100,
 	}, nil
 }
