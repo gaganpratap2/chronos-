@@ -15,7 +15,7 @@ func NextJobID(
 
 	err := tx.QueryRow(
 		ctx,
-		`SELECT nextval('job_id_seq')`,
+		`SELECT nextval('jobs_id_seq')`,
 	).Scan(&jobID)
 
 	if err != nil {

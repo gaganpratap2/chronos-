@@ -100,13 +100,13 @@ func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 	}
 	defer pool.Close()
 
-	const testID = 2
+	const testID = 998102
 
 	// Remove the test job before and after the test.
-	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
-	if err != nil {
-		t.Fatalf("failed to prepare test: %v", err)
-	}
+	// _, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
+	// if err != nil {
+	// 	t.Fatalf("failed to prepare test: %v", err)
+	// }
 
 	defer func() {
 		_, _ = pool.Exec(
@@ -125,6 +125,25 @@ func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 
 	if err := database.SaveJob(ctx, pool, j); err != nil {
 		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+    UPDATE jobs
+    SET run_at = LEAST(
+        NOW() - INTERVAL '1 minute',
+        COALESCE(
+            (
+                SELECT MIN(run_at) - INTERVAL '1 second'
+                FROM jobs
+                WHERE id <> $1
+            ),
+            NOW() - INTERVAL '1 minute'
+        )
+    )
+    WHERE id = $1
+`, testID)
+	if err != nil {
+		t.Fatalf("position test job for claiming: %v", err)
 	}
 
 	handler := &fakeHandler{}
@@ -197,6 +216,24 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 
 	if err := database.SaveJob(ctx, pool, j); err != nil {
 		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	// Ensure this test's job is ordered before existing jobs.
+	// Only the test-owned row is modified.
+	_, err = pool.Exec(ctx, `
+    UPDATE jobs
+    SET run_at = COALESCE(
+        (
+            SELECT MIN(run_at) - INTERVAL '1 second'
+            FROM jobs
+            WHERE id <> $1
+        ),
+        NOW() - INTERVAL '1 minute'
+    )
+    WHERE id = $1
+`, testID)
+	if err != nil {
+		t.Fatalf("position test job for claiming: %v", err)
 	}
 
 	handler := &fakeHandler{
@@ -760,18 +797,33 @@ func TestTwoWorkersClaimConcurrently(t *testing.T) {
 	}
 	defer pool.Close()
 
-	job1, err := job.NewJob(987666, "concurrent-worker-a")
+	baseID := int(time.Now().UnixNano()%800_000_000) + 1_000_000_000
+
+	job1, err := job.NewJob(baseID, "concurrent-worker-a")
 	if err != nil {
 		t.Fatalf("create job1: %v", err)
 	}
 
-	job2, err := job.NewJob(987667, "concurrent-worker-b")
+	job2, err := job.NewJob(baseID+1, "concurrent-worker-b")
 	if err != nil {
 		t.Fatalf("create job2: %v", err)
 	}
 
 	if err := database.SaveJob(ctx, pool, job1); err != nil {
 		t.Fatalf("save job1: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+    UPDATE jobs
+    SET run_at = (
+        SELECT COALESCE(MIN(run_at), NOW()) - INTERVAL '1 minute'
+        FROM jobs
+        WHERE id <> $1 AND id <> $2
+    )
+    WHERE id = $1 OR id = $2
+`, job1.ID, job2.ID)
+	if err != nil {
+		t.Fatalf("position concurrent test jobs: %v", err)
 	}
 
 	if err := database.SaveJob(ctx, pool, job2); err != nil {

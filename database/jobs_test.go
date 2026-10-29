@@ -427,14 +427,15 @@ func TestClaimNextJob(t *testing.T) {
 	}
 	defer pool.Close()
 
-	const testID = 1
+	testID := int(time.Now().UnixNano()%900_000_000) + 1_000_000_000
 
-	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
-	if err != nil {
-		t.Fatalf("failed to prepare test: %v", err)
-	}
-	defer pool.Exec(context.Background(),
-		"DELETE FROM jobs WHERE id = $1", testID)
+	defer func() {
+		_, _ = pool.Exec(
+			context.Background(),
+			"DELETE FROM jobs WHERE id = $1",
+			testID,
+		)
+	}()
 
 	j, err := job.NewJob(testID, "claim-test")
 	if err != nil {
@@ -443,6 +444,22 @@ func TestClaimNextJob(t *testing.T) {
 
 	if err := SaveJob(ctx, pool, j); err != nil {
 		t.Fatalf("SaveJob failed: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+    UPDATE jobs
+    SET run_at = COALESCE(
+        (
+            SELECT MIN(run_at) - INTERVAL '1 second'
+            FROM jobs
+            WHERE id <> $1
+        ),
+        NOW() - INTERVAL '1 minute'
+    )
+    WHERE id = $1
+`, testID)
+	if err != nil {
+		t.Fatalf("position test job for claiming: %v", err)
 	}
 
 	claimed, err := ClaimNextJob(ctx, pool, "test-worker")
@@ -584,7 +601,7 @@ func TestClaimNextJobRecoversExpiredLease(t *testing.T) {
 	}
 	defer pool.Close()
 
-	const testID = 987665
+	testID := int(time.Now().UnixNano()%900_000_000) + 1_000_000_000
 
 	_, err = pool.Exec(
 		ctx,
@@ -601,11 +618,38 @@ func TestClaimNextJobRecoversExpiredLease(t *testing.T) {
 		testID,
 	)
 
-	_, err = pool.Exec(ctx,
-		`INSERT INTO jobs
-		(id, name, status, retry_count, max_retries,
-		 next_retry_at, worker_id, lease_until, fencing_token)
-		VALUES ($1, $2, 'Running', 0, 3, NULL, $3, NOW() - INTERVAL '1 second', $4)`,
+	_, err = pool.Exec(ctx, `
+    INSERT INTO jobs (
+        id,
+        name,
+        status,
+        run_at,
+        retry_count,
+        max_retries,
+        next_retry_at,
+        worker_id,
+        lease_until,
+        fencing_token
+    )
+    VALUES (
+        $1,
+        $2,
+        'Running',
+        COALESCE(
+            (
+                SELECT MIN(run_at) - INTERVAL '1 second'
+                FROM jobs
+            ),
+            NOW() - INTERVAL '1 minute'
+        ),
+        0,
+        3,
+        NULL,
+        $3,
+        NOW() - INTERVAL '1 second',
+        $4
+    )
+`,
 		testID,
 		"expired-lease-test",
 		"worker-A",
@@ -849,9 +893,12 @@ func TestRetryJobCapsExponentialBackoff(t *testing.T) {
 		)
 	}
 }
-
 func TestClaimNextJobIncrementsFencingToken(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
 
 	if err := godotenv.Load("../.env"); err != nil {
 		t.Fatalf("load .env: %v", err)
@@ -863,7 +910,9 @@ func TestClaimNextJobIncrementsFencingToken(t *testing.T) {
 	}
 	defer pool.Close()
 
-	j, err := job.NewJob(987670, "fencing-token-test")
+	testID := int(time.Now().UnixNano()%800_000_000) + 1_000_000_000
+
+	j, err := job.NewJob(testID, "fencing-token-test")
 	if err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -873,15 +922,41 @@ func TestClaimNextJobIncrementsFencingToken(t *testing.T) {
 	}
 
 	defer func() {
-		_, _ = pool.Exec(ctx,
+		_, _ = pool.Exec(
+			context.Background(),
 			"DELETE FROM jobs WHERE id = $1",
-			j.ID,
+			testID,
 		)
 	}()
 
-	claimed, err := ClaimNextJob(ctx, pool, "worker-A")
+	// Position only this test's job ahead of existing jobs.
+	_, err = pool.Exec(ctx, `
+		UPDATE jobs
+		SET run_at = COALESCE(
+			(
+				SELECT MIN(run_at) - INTERVAL '1 second'
+				FROM jobs
+				WHERE id <> $1
+			),
+			NOW() - INTERVAL '1 minute'
+		)
+		WHERE id = $1
+	`, testID)
+	if err != nil {
+		t.Fatalf("position test job for claiming: %v", err)
+	}
+
+	claimed, err := ClaimNextJob(ctx, pool, "worker-fencing-test")
 	if err != nil {
 		t.Fatalf("first claim: %v", err)
+	}
+
+	if claimed.ID != testID {
+		t.Fatalf(
+			"expected to claim test job %d, got job %d",
+			testID,
+			claimed.ID,
+		)
 	}
 
 	if claimed.FencingToken != 1 {
@@ -890,7 +965,6 @@ func TestClaimNextJobIncrementsFencingToken(t *testing.T) {
 			claimed.FencingToken,
 		)
 	}
-
 }
 
 func TestTransitionJobStatusRejectsStaleFencingToken(t *testing.T) {

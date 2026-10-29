@@ -231,6 +231,19 @@ func main() {
 		transitionJobStatusHandler(pool),
 	)
 
+	mux.HandleFunc(
+		"PATCH /recurring-schedules/{id}/enabled",
+		recurringScheduleEnabledHandler(pool),
+	)
+	mux.HandleFunc(
+		"PATCH /recurring-schedules/{id}/interval",
+		rescheduleIntervalHandler(pool),
+	)
+	mux.HandleFunc(
+		"PATCH /recurring-schedules/{id}/cron",
+		rescheduleCronHandler(pool),
+	)
+
 	fmt.Println("Chronos API listening on http://localhost:8080")
 
 	server := &http.Server{

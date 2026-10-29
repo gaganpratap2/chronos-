@@ -260,18 +260,22 @@ func TestWorkflowEndToEnd(t *testing.T) {
 	// The worker claims jobs globally. For this test we temporarily
 	// move unrelated Pending jobs out of the runnable state so that
 	// the worker can deterministically claim task A's job.
-	_, err = pool.Exec(
-		ctx,
-		`
-			UPDATE jobs
-			SET status = 'Completed'
-			WHERE status = 'Pending'
-			AND id <> $1
-			`,
-		dispatched.JobID,
-	)
+	// Make this test-owned job the earliest eligible job.
+	// Do not modify the status of unrelated jobs.
+	_, err = pool.Exec(ctx, `
+    UPDATE jobs
+    SET run_at = COALESCE(
+        (
+            SELECT MIN(run_at) - INTERVAL '1 second'
+            FROM jobs
+            WHERE id <> $1
+        ),
+        NOW() - INTERVAL '1 minute'
+    )
+    WHERE id = $1
+`, dispatched.JobID)
 	if err != nil {
-		t.Fatalf("isolate unrelated pending jobs: %v", err)
+		t.Fatalf("position workflow test job for claiming: %v", err)
 	}
 
 	handler := &workflowTestHandler{}

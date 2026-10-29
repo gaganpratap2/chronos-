@@ -351,3 +351,178 @@ func ClaimRecurringSchedule(
 
 	return s, createdJobs, nil
 }
+
+func SetRecurringScheduleEnabled(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	id int64,
+	enabled bool,
+) error {
+	result, err := pool.Exec(ctx, `
+		UPDATE recurring_schedules
+		SET enabled = $2
+		WHERE id = $1
+	`, id, enabled)
+	if err != nil {
+		return fmt.Errorf(
+			"update recurring schedule %d enabled state: %w",
+			id,
+			err,
+		)
+	}
+
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf(
+			"recurring schedule %d not found",
+			id,
+		)
+	}
+
+	return nil
+}
+func RescheduleIntervalSchedule(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	id int64,
+	newInterval time.Duration,
+) error {
+	if id <= 0 {
+		return fmt.Errorf("recurring schedule ID must be positive")
+	}
+
+	if newInterval < time.Second ||
+		newInterval%time.Second != 0 {
+		return fmt.Errorf(
+			"interval must be at least one second and use whole seconds",
+		)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin schedule rescheduling: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var scheduleType string
+
+	err = tx.QueryRow(ctx, `
+		SELECT schedule_type
+		FROM recurring_schedules
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&scheduleType)
+	if err != nil {
+		return fmt.Errorf(
+			"load recurring schedule %d: %w",
+			id,
+			err,
+		)
+	}
+
+	if scheduleType != string(schedule.ScheduleInterval) {
+		return fmt.Errorf(
+			"recurring schedule %d is not an interval schedule",
+			id,
+		)
+	}
+
+	seconds := int64(newInterval / time.Second)
+
+	_, err = tx.Exec(ctx, `
+		UPDATE recurring_schedules
+SET interval_seconds = $2::bigint,
+    next_run_at = NOW() + (
+        $2::double precision * INTERVAL '1 second'
+    )
+WHERE id = $1
+	`, id, seconds)
+	if err != nil {
+		return fmt.Errorf(
+			"reschedule recurring schedule %d: %w",
+			id,
+			err,
+		)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf(
+			"commit recurring schedule rescheduling: %w",
+			err,
+		)
+	}
+
+	return nil
+}
+
+func RescheduleCronSchedule(ctx context.Context, pool *pgxpool.Pool, id int64, cronExpression string, timezone string) error {
+	if id <= 0 {
+		return fmt.Errorf("recurring schedule ID must be positive")
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin cron rescheduling: %w", err)
+	}
+
+	defer tx.Rollback(ctx)
+
+	var scheduleType string
+
+	err = tx.QueryRow(ctx,
+		`
+		SELECT schedule_type
+		FROM recurring_schedules
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&scheduleType)
+
+	if err != nil {
+		return fmt.Errorf(
+			"load recurring schedule %d: %w",
+			id,
+			err,
+		)
+	}
+
+	if scheduleType != string(schedule.ScheduleCron) {
+		return fmt.Errorf(
+			"recurring schedule %d is not a cron schedule",
+			id,
+		)
+	}
+
+	nextRunAt, err := schedule.NextCronOccurrence(
+		cronExpression,
+		timezone,
+		time.Now(),
+	)
+	if err != nil {
+		return fmt.Errorf("calculate next cron occurrence: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE recurring_schedules
+		SET cron_expression = $2,
+		    timezone = $3,
+		    next_run_at = $4
+		WHERE id = $1
+	`,
+		id,
+		cronExpression,
+		timezone,
+		nextRunAt,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"reschedule cron schedule %d: %w",
+			id,
+			err,
+		)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit cron rescheduling: %w", err)
+	}
+
+	return nil
+}
