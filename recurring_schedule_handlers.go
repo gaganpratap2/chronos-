@@ -224,3 +224,170 @@ func rescheduleCronHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		writeRecurringSchedule(w, r, pool, id, "retrieve")
 	}
 }
+
+// func newRecurringScheduleHandlerTestMuxWithPool(
+// 	pool *pgxpool.Pool,
+// ) *http.ServeMux {
+// 	mux := http.NewServeMux()
+
+// 	mux.HandleFunc(
+// 		"PATCH /recurring-schedules/{id}/enabled",
+// 		recurringScheduleEnabledHandler(pool),
+// 	)
+// 	mux.HandleFunc(
+// 		"PATCH /recurring-schedules/{id}/interval",
+// 		rescheduleIntervalHandler(pool),
+// 	)
+// 	mux.HandleFunc(
+// 		"PATCH /recurring-schedules/{id}/cron",
+// 		rescheduleCronHandler(pool),
+// 	)
+
+// 	return mux
+// }
+
+// func newRecurringScheduleHandlerTestPool(
+// 	t *testing.T,
+// ) *pgxpool.Pool {
+// 	t.Helper()
+
+// 	if err := godotenv.Load(); err != nil {
+// 		t.Log(".env not found; using system environment variables")
+// 	}
+
+// 	ctx, cancel := context.WithTimeout(
+// 		context.Background(),
+// 		10*time.Second,
+// 	)
+// 	defer cancel()
+
+// 	pool, err := database.Connect(ctx)
+// 	if err != nil {
+// 		t.Fatalf("connect to database: %v", err)
+// 	}
+
+// 	t.Cleanup(pool.Close)
+
+// 	return pool
+// }
+
+// func createHandlerTestIntervalSchedule(
+// 	t *testing.T,
+// 	pool *pgxpool.Pool,
+// ) int64 {
+// 	t.Helper()
+
+// 	ctx, cancel := context.WithTimeout(
+// 		context.Background(),
+// 		10*time.Second,
+// 	)
+// 	defer cancel()
+
+// 	name := fmt.Sprintf(
+// 		"api-interval-test-%d",
+// 		time.Now().UnixNano(),
+// 	)
+
+// 	original, err := schedule.NewRecurringSchedule(
+// 		name,
+// 		5*time.Minute,
+// 		time.Now().Add(time.Hour),
+// 	)
+// 	if err != nil {
+// 		t.Fatalf("create interval schedule: %v", err)
+// 	}
+
+// 	if err := database.SaveRecurringSchedule(ctx, pool, original); err != nil {
+// 		t.Fatalf("save interval schedule: %v", err)
+// 	}
+
+// 	var id int64
+// 	err = pool.QueryRow(
+// 		ctx,
+// 		`SELECT id FROM recurring_schedules WHERE name = $1`,
+// 		name,
+// 	).Scan(&id)
+// 	if err != nil {
+// 		t.Fatalf("get interval schedule ID: %v", err)
+// 	}
+
+// 	t.Cleanup(func() {
+// 		cleanupCtx, cleanupCancel := context.WithTimeout(
+// 			context.Background(),
+// 			5*time.Second,
+// 		)
+// 		defer cleanupCancel()
+
+// 		_, err := pool.Exec(
+// 			cleanupCtx,
+// 			`DELETE FROM recurring_schedules WHERE id = $1`,
+// 			id,
+// 		)
+// 		if err != nil {
+// 			t.Errorf("delete test interval schedule: %v", err)
+// 		}
+// 	})
+
+// 	return id
+// }
+
+// func createHandlerTestCronSchedule(
+// 	t *testing.T,
+// 	pool *pgxpool.Pool,
+// ) int64 {
+// 	t.Helper()
+
+// 	ctx, cancel := context.WithTimeout(
+// 		context.Background(),
+// 		10*time.Second,
+// 	)
+// 	defer cancel()
+
+// 	name := fmt.Sprintf(
+// 		"api-cron-test-%d",
+// 		time.Now().UnixNano(),
+// 	)
+
+// 	original, err := schedule.NewCronSchedule(
+// 		name,
+// 		"0 9 * * *",
+// 		"Asia/Kolkata",
+// 		time.Now().Add(24*time.Hour),
+// 	)
+// 	if err != nil {
+// 		t.Fatalf("create cron schedule: %v", err)
+// 	}
+
+// 	if err := database.SaveRecurringSchedule(ctx, pool, original); err != nil {
+// 		t.Fatalf("save cron schedule: %v", err)
+// 	}
+
+// 	var id int64
+// 	err = pool.QueryRow(
+// 		ctx,
+// 		`SELECT id FROM recurring_schedules WHERE name = $1`,
+// 		name,
+// 	).Scan(&id)
+// 	if err != nil {
+// 		t.Fatalf("get cron schedule ID: %v", err)
+// 	}
+
+// 	t.Cleanup(func() {
+// 		cleanupCtx, cleanupCancel := context.WithTimeout(
+// 			context.Background(),
+// 			5*time.Second,
+// 		)
+// 		defer cleanupCancel()
+
+// 		_, err := pool.Exec(
+// 			cleanupCtx,
+// 			`DELETE FROM recurring_schedules WHERE id = $1`,
+// 			id,
+// 		)
+// 		if err != nil {
+// 			t.Errorf("delete test cron schedule: %v", err)
+// 		}
+// 	})
+
+// 	return id
+// }
