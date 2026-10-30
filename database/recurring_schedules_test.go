@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -1638,5 +1639,883 @@ func TestRescheduleCronScheduleRejectsIntervalSchedule(t *testing.T) {
 			after.NextRunAt,
 			before.NextRunAt,
 		)
+	}
+}
+
+func TestCancelRecurringSchedule(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	scheduleName := fmt.Sprintf(
+		"cancel-schedule-%d",
+		time.Now().UnixNano(),
+	)
+
+	original, err := schedule.NewRecurringSchedule(
+		scheduleName,
+		5*time.Minute,
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("create recurring schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, original); err != nil {
+		t.Fatalf("save recurring schedule: %v", err)
+	}
+
+	var scheduleID int64
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id FROM recurring_schedules WHERE name = $1`,
+		scheduleName,
+	).Scan(&scheduleID)
+	if err != nil {
+		t.Fatalf("get schedule ID: %v", err)
+	}
+
+	defer func() {
+		_, _ = pool.Exec(
+			context.Background(),
+			`DELETE FROM recurring_schedules WHERE id = $1`,
+			scheduleID,
+		)
+	}()
+
+	// First cancellation.
+	if err := CancelRecurringSchedule(ctx, pool, scheduleID); err != nil {
+		t.Fatalf("cancel recurring schedule: %v", err)
+	}
+
+	cancelled, err := GetRecurringSchedule(ctx, pool, scheduleID)
+	if err != nil {
+		t.Fatalf("get cancelled schedule: %v", err)
+	}
+
+	if cancelled.Enabled {
+		t.Fatal("expected cancelled schedule to be disabled")
+	}
+
+	if cancelled.CancelledAt == nil {
+		t.Fatal("expected cancellation timestamp to be recorded")
+	}
+
+	firstCancellation := *cancelled.CancelledAt
+
+	// Wait briefly so an accidental timestamp overwrite is detectable.
+	time.Sleep(20 * time.Millisecond)
+
+	// Second cancellation should succeed without changing the timestamp.
+	if err := CancelRecurringSchedule(ctx, pool, scheduleID); err != nil {
+		t.Fatalf("repeated cancellation should succeed: %v", err)
+	}
+
+	cancelledAgain, err := GetRecurringSchedule(ctx, pool, scheduleID)
+	if err != nil {
+		t.Fatalf("get schedule after repeated cancellation: %v", err)
+	}
+
+	if cancelledAgain.CancelledAt == nil {
+		t.Fatal("expected cancellation timestamp to remain present")
+	}
+
+	if !cancelledAgain.CancelledAt.Equal(firstCancellation) {
+		t.Fatalf(
+			"cancellation timestamp changed: first=%v, second=%v",
+			firstCancellation,
+			*cancelledAgain.CancelledAt,
+		)
+	}
+
+	if cancelledAgain.Enabled {
+		t.Fatal("expected schedule to remain disabled after repeated cancellation")
+	}
+}
+
+func TestCancelledRecurringScheduleCannotBeResumedOrClaimed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	scheduleName := fmt.Sprintf(
+		"cancelled-lifecycle-%d",
+		time.Now().UnixNano(),
+	)
+
+	original, err := schedule.NewRecurringSchedule(
+		scheduleName,
+		5*time.Minute,
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("create recurring schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, original); err != nil {
+		t.Fatalf("save recurring schedule: %v", err)
+	}
+
+	var scheduleID int64
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id FROM recurring_schedules WHERE name = $1`,
+		scheduleName,
+	).Scan(&scheduleID)
+	if err != nil {
+		t.Fatalf("get schedule ID: %v", err)
+	}
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM jobs WHERE name LIKE $1`,
+			scheduleName+"-%",
+		)
+
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM recurring_schedules WHERE id = $1`,
+			scheduleID,
+		)
+	}()
+
+	// Make the schedule due so a claim would generate jobs
+	// if cancellation protection were missing.
+	_, err = pool.Exec(ctx, `
+		UPDATE recurring_schedules
+		SET next_run_at = NOW() - INTERVAL '10 minutes'
+		WHERE id = $1
+	`, scheduleID)
+	if err != nil {
+		t.Fatalf("make schedule due: %v", err)
+	}
+
+	// Permanently cancel the schedule.
+	if err := CancelRecurringSchedule(ctx, pool, scheduleID); err != nil {
+		t.Fatalf("cancel recurring schedule: %v", err)
+	}
+
+	// The application-level function must reject resuming it.
+	err = SetRecurringScheduleEnabled(
+		ctx,
+		pool,
+		scheduleID,
+		true,
+	)
+	if err == nil {
+		t.Fatal("expected cancelled schedule to reject re-enabling")
+	}
+
+	// The database constraint must also reject direct re-enabling.
+	_, err = pool.Exec(ctx, `
+		UPDATE recurring_schedules
+		SET enabled = TRUE
+		WHERE id = $1
+	`, scheduleID)
+	if err == nil {
+		t.Fatal("expected database constraint to reject re-enabling")
+	}
+
+	// A direct claim must not generate jobs.
+	_, createdJobs, err := ClaimRecurringSchedule(
+		ctx,
+		pool,
+		scheduleID,
+	)
+	if err == nil {
+		t.Fatal("expected cancelled schedule claim to fail")
+	}
+
+	if len(createdJobs) != 0 {
+		t.Fatalf(
+			"expected zero jobs, got %d",
+			len(createdJobs),
+		)
+	}
+
+	// Verify the permanent cancellation state remains intact.
+	saved, err := GetRecurringSchedule(ctx, pool, scheduleID)
+	if err != nil {
+		t.Fatalf("get cancelled schedule: %v", err)
+	}
+
+	if saved.Enabled {
+		t.Fatal("cancelled schedule became enabled")
+	}
+
+	if saved.CancelledAt == nil {
+		t.Fatal("expected cancellation timestamp to remain present")
+	}
+
+	// Verify that no recurring jobs were generated.
+	var jobCount int
+	err = pool.QueryRow(
+		ctx,
+		`SELECT COUNT(*) FROM jobs WHERE name LIKE $1`,
+		scheduleName+"-%",
+	).Scan(&jobCount)
+	if err != nil {
+		t.Fatalf("count generated jobs: %v", err)
+	}
+
+	if jobCount != 0 {
+		t.Fatalf("expected zero generated jobs, got %d", jobCount)
+	}
+}
+
+func TestConcurrentCancelAndEnableRecurringSchedule(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	name := fmt.Sprintf(
+		"concurrent-cancel-enable-%d",
+		time.Now().UnixNano(),
+	)
+
+	original, err := schedule.NewRecurringSchedule(
+		name,
+		5*time.Minute,
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("create recurring schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, original); err != nil {
+		t.Fatalf("save recurring schedule: %v", err)
+	}
+
+	var scheduleID int64
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id FROM recurring_schedules WHERE name = $1`,
+		name,
+	).Scan(&scheduleID)
+	if err != nil {
+		t.Fatalf("get schedule ID: %v", err)
+	}
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM recurring_schedules WHERE id = $1`,
+			scheduleID,
+		)
+	}()
+
+	start := make(chan struct{})
+
+	cancelResult := make(chan error, 1)
+	enableResult := make(chan error, 1)
+
+	// Request A: permanently cancel the schedule.
+	go func() {
+		<-start
+		cancelResult <- CancelRecurringSchedule(
+			ctx,
+			pool,
+			scheduleID,
+		)
+	}()
+
+	// Request B: attempt to enable the schedule.
+	go func() {
+		<-start
+		enableResult <- SetRecurringScheduleEnabled(
+			ctx,
+			pool,
+			scheduleID,
+			true,
+		)
+	}()
+
+	// Release both requests at approximately the same time.
+	close(start)
+
+	cancelErr := <-cancelResult
+	enableErr := <-enableResult
+
+	if cancelErr != nil {
+		t.Fatalf("cancellation failed: %v", cancelErr)
+	}
+
+	// Enabling may succeed if it commits before cancellation.
+	// Otherwise, it must be rejected because cancellation won.
+	if enableErr != nil &&
+		!strings.Contains(
+			enableErr.Error(),
+			"permanently cancelled",
+		) {
+		t.Fatalf("unexpected enable error: %v", enableErr)
+	}
+
+	saved, err := GetRecurringSchedule(ctx, pool, scheduleID)
+	if err != nil {
+		t.Fatalf("get final schedule state: %v", err)
+	}
+
+	if saved.CancelledAt == nil {
+		t.Fatal("expected schedule to be permanently cancelled")
+	}
+
+	if saved.Enabled {
+		t.Fatal("schedule must remain disabled after concurrent cancellation")
+	}
+}
+
+func TestCancelledRecurringSchedulesCannotBeRescheduled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	// Create an interval schedule.
+	intervalName := fmt.Sprintf(
+		"cancelled-interval-%d",
+		time.Now().UnixNano(),
+	)
+
+	intervalSchedule, err := schedule.NewRecurringSchedule(
+		intervalName,
+		5*time.Minute,
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("create interval schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, intervalSchedule); err != nil {
+		t.Fatalf("save interval schedule: %v", err)
+	}
+
+	var intervalID int64
+	err = pool.QueryRow(ctx,
+		`SELECT id FROM recurring_schedules WHERE name = $1`,
+		intervalName,
+	).Scan(&intervalID)
+	if err != nil {
+		t.Fatalf("get interval schedule ID: %v", err)
+	}
+
+	// Create a cron schedule.
+	cronName := fmt.Sprintf(
+		"cancelled-cron-%d",
+		time.Now().UnixNano(),
+	)
+
+	cronSchedule, err := schedule.NewCronSchedule(
+		cronName,
+		"0 9 * * *",
+		"Asia/Kolkata",
+		time.Now().Add(24*time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("create cron schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, cronSchedule); err != nil {
+		t.Fatalf("save cron schedule: %v", err)
+	}
+
+	var cronID int64
+	err = pool.QueryRow(ctx,
+		`SELECT id FROM recurring_schedules WHERE name = $1`,
+		cronName,
+	).Scan(&cronID)
+	if err != nil {
+		t.Fatalf("get cron schedule ID: %v", err)
+	}
+
+	// Clean up only the schedules created by this test.
+	defer func() {
+		_, _ = pool.Exec(
+			context.Background(),
+			`DELETE FROM recurring_schedules WHERE id IN ($1, $2)`,
+			intervalID,
+			cronID,
+		)
+	}()
+
+	// Permanently cancel both schedules.
+	if err := CancelRecurringSchedule(ctx, pool, intervalID); err != nil {
+		t.Fatalf("cancel interval schedule: %v", err)
+	}
+
+	if err := CancelRecurringSchedule(ctx, pool, cronID); err != nil {
+		t.Fatalf("cancel cron schedule: %v", err)
+	}
+
+	// Save their original configuration.
+	beforeInterval, err := GetRecurringSchedule(ctx, pool, intervalID)
+	if err != nil {
+		t.Fatalf("get cancelled interval schedule: %v", err)
+	}
+
+	beforeCron, err := GetRecurringSchedule(ctx, pool, cronID)
+	if err != nil {
+		t.Fatalf("get cancelled cron schedule: %v", err)
+	}
+
+	// Attempt to reschedule the cancelled interval schedule.
+	err = RescheduleIntervalSchedule(
+		ctx,
+		pool,
+		intervalID,
+		15*time.Minute,
+	)
+	if err == nil {
+		t.Error("expected cancelled interval schedule to reject rescheduling")
+	}
+
+	afterInterval, err := GetRecurringSchedule(ctx, pool, intervalID)
+	if err != nil {
+		t.Fatalf("get interval schedule after rescheduling attempt: %v", err)
+	}
+
+	if afterInterval.Interval != beforeInterval.Interval {
+		t.Errorf(
+			"cancelled interval changed: got %v, want %v",
+			afterInterval.Interval,
+			beforeInterval.Interval,
+		)
+	}
+
+	if !afterInterval.NextRunAt.Equal(beforeInterval.NextRunAt) {
+		t.Error("cancelled interval next_run_at was modified")
+	}
+
+	// Attempt to reschedule the cancelled cron schedule.
+	err = RescheduleCronSchedule(
+		ctx,
+		pool,
+		cronID,
+		"*/5 * * * *",
+		"UTC",
+	)
+	if err == nil {
+		t.Error("expected cancelled cron schedule to reject rescheduling")
+	}
+
+	afterCron, err := GetRecurringSchedule(ctx, pool, cronID)
+	if err != nil {
+		t.Fatalf("get cron schedule after rescheduling attempt: %v", err)
+	}
+
+	if afterCron.CronExpression != beforeCron.CronExpression {
+		t.Errorf(
+			"cancelled cron expression changed: got %q, want %q",
+			afterCron.CronExpression,
+			beforeCron.CronExpression,
+		)
+	}
+
+	if afterCron.Timezone != beforeCron.Timezone {
+		t.Errorf(
+			"cancelled cron timezone changed: got %q, want %q",
+			afterCron.Timezone,
+			beforeCron.Timezone,
+		)
+	}
+
+	if !afterCron.NextRunAt.Equal(beforeCron.NextRunAt) {
+		t.Error("cancelled cron next_run_at was modified")
+	}
+}
+
+func TestCancelRecurringSchedulePreservesExistingJobs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	scheduleName := fmt.Sprintf(
+		"cancel-preserve-jobs-%d",
+		time.Now().UnixNano(),
+	)
+
+	original, err := schedule.NewRecurringSchedule(
+		scheduleName,
+		5*time.Minute,
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("create recurring schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, original); err != nil {
+		t.Fatalf("save recurring schedule: %v", err)
+	}
+
+	var scheduleID int64
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id FROM recurring_schedules WHERE name = $1`,
+		scheduleName,
+	).Scan(&scheduleID)
+	if err != nil {
+		t.Fatalf("get schedule ID: %v", err)
+	}
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM jobs WHERE name LIKE $1`,
+			scheduleName+"-%",
+		)
+
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM recurring_schedules WHERE id = $1`,
+			scheduleID,
+		)
+	}()
+
+	// Make the schedule due and use fire_once to generate
+	// one job for the missed occurrence.
+	_, err = pool.Exec(ctx, `
+		UPDATE recurring_schedules
+		SET next_run_at = NOW() - INTERVAL '5 minutes',
+		    catch_up_policy = 'fire_once'
+		WHERE id = $1
+	`, scheduleID)
+	if err != nil {
+		t.Fatalf("make schedule due: %v", err)
+	}
+
+	// Generate a recurring job before cancellation.
+	_, createdJobs, err := ClaimRecurringSchedule(
+		ctx,
+		pool,
+		scheduleID,
+	)
+	if err != nil {
+		t.Fatalf("claim recurring schedule: %v", err)
+	}
+
+	if len(createdJobs) == 0 {
+		t.Fatal("expected at least one job to be generated")
+	}
+
+	// Confirm generated jobs are pending.
+	for _, createdJob := range createdJobs {
+		var status string
+
+		err := pool.QueryRow(
+			ctx,
+			`SELECT status FROM jobs WHERE id = $1`,
+			createdJob.ID,
+		).Scan(&status)
+		if err != nil {
+			t.Fatalf(
+				"get generated job %d: %v",
+				createdJob.ID,
+				err,
+			)
+		}
+
+		if status != "Pending" {
+			t.Fatalf(
+				"expected job %d to be Pending, got %q",
+				createdJob.ID,
+				status,
+			)
+		}
+	}
+
+	// Permanently cancel the recurring schedule.
+	if err := CancelRecurringSchedule(ctx, pool, scheduleID); err != nil {
+		t.Fatalf("cancel recurring schedule: %v", err)
+	}
+
+	// Existing jobs must remain pending.
+	for _, createdJob := range createdJobs {
+		var status string
+
+		err := pool.QueryRow(
+			ctx,
+			`SELECT status FROM jobs WHERE id = $1`,
+			createdJob.ID,
+		).Scan(&status)
+		if err != nil {
+			t.Fatalf(
+				"get existing job %d after cancellation: %v",
+				createdJob.ID,
+				err,
+			)
+		}
+
+		if status != "Pending" {
+			t.Errorf(
+				"existing job %d changed status after cancellation: got %q, want Pending",
+				createdJob.ID,
+				status,
+			)
+		}
+	}
+}
+
+func TestConcurrentCancelAndClaimRecurringSchedule(t *testing.T) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Log(".env not found; using system environment variables")
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	scheduleName := fmt.Sprintf(
+		"concurrent-cancel-claim-%d",
+		time.Now().UnixNano(),
+	)
+
+	original, err := schedule.NewRecurringSchedule(
+		scheduleName,
+		5*time.Minute,
+		time.Now().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("create recurring schedule: %v", err)
+	}
+
+	if err := SaveRecurringSchedule(ctx, pool, original); err != nil {
+		t.Fatalf("save recurring schedule: %v", err)
+	}
+
+	var scheduleID int64
+	err = pool.QueryRow(
+		ctx,
+		`SELECT id FROM recurring_schedules WHERE name = $1`,
+		scheduleName,
+	).Scan(&scheduleID)
+	if err != nil {
+		t.Fatalf("get schedule ID: %v", err)
+	}
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM jobs WHERE name LIKE $1`,
+			scheduleName+"-%",
+		)
+
+		_, _ = pool.Exec(
+			cleanupCtx,
+			`DELETE FROM recurring_schedules WHERE id = $1`,
+			scheduleID,
+		)
+	}()
+
+	// Make the schedule due. fire_once ensures that this
+	// claim creates at most one job for the missed occurrence.
+	_, err = pool.Exec(ctx, `
+		UPDATE recurring_schedules
+		SET next_run_at = NOW() - INTERVAL '1 hour',
+		    catch_up_policy = 'fire_once'
+		WHERE id = $1
+	`, scheduleID)
+	if err != nil {
+		t.Fatalf("make schedule due: %v", err)
+	}
+
+	start := make(chan struct{})
+
+	cancelResult := make(chan error, 1)
+
+	type claimOutcome struct {
+		jobCount int
+		err      error
+	}
+
+	claimResult := make(chan claimOutcome, 1)
+
+	// Goroutine A: permanently cancel the schedule.
+	// go func() {
+	// 	<-start
+
+	// 	claimResult <- claimOutcome{
+	// 		jobCount: 0,
+	// 		err:      nil,
+	// 	}
+	// }()
+
+	go func() {
+		<-start
+
+		cancelResult <- CancelRecurringSchedule(
+			ctx,
+			pool,
+			scheduleID,
+		)
+	}()
+
+	// Goroutine B: attempt to generate recurring jobs.
+	go func() {
+		<-start
+
+		_, jobs, err := ClaimRecurringSchedule(
+			ctx,
+			pool,
+			scheduleID,
+		)
+
+		claimResult <- claimOutcome{
+			jobCount: len(jobs),
+			err:      err,
+		}
+	}()
+
+	close(start)
+
+	cancelErr := <-cancelResult
+	if cancelErr != nil {
+		t.Fatalf("cancel recurring schedule: %v", cancelErr)
+	}
+
+	claim := <-claimResult
+
+	// Claim may succeed before cancellation, or be rejected
+	// after cancellation. No other result is acceptable.
+	if claim.err != nil &&
+		!strings.Contains(
+			claim.err.Error(),
+			"permanently cancelled",
+		) {
+		t.Fatalf("unexpected claim error: %v", claim.err)
+	}
+
+	if claim.err == nil && claim.jobCount == 0 {
+		t.Fatal("expected claim to generate a job or return a cancellation error")
+	}
+
+	if claim.err != nil && claim.jobCount != 0 {
+		t.Fatalf(
+			"claim returned an error but reported %d jobs",
+			claim.jobCount,
+		)
+	}
+
+	// Verify the actual number of persisted jobs.
+	var persistedJobs int
+	err = pool.QueryRow(
+		ctx,
+		`SELECT COUNT(*) FROM jobs WHERE name LIKE $1`,
+		scheduleName+"-%",
+	).Scan(&persistedJobs)
+	if err != nil {
+		t.Fatalf("count persisted recurring jobs: %v", err)
+	}
+
+	if persistedJobs != claim.jobCount {
+		t.Fatalf(
+			"persisted jobs=%d, claim reported=%d",
+			persistedJobs,
+			claim.jobCount,
+		)
+	}
+
+	// Cancellation must win in the final state.
+	saved, err := GetRecurringSchedule(ctx, pool, scheduleID)
+	if err != nil {
+		t.Fatalf("get final recurring schedule: %v", err)
+	}
+
+	if saved.CancelledAt == nil {
+		t.Fatal("expected permanent cancellation timestamp")
+	}
+
+	if saved.Enabled {
+		t.Fatal("expected schedule to remain disabled")
 	}
 }

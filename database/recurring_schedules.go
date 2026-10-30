@@ -74,6 +74,7 @@ func GetRecurringSchedule(
 	var intervalSeconds int64
 	var cronExpression *string
 	var timezone *string
+	var cancelledAt *time.Time
 
 	err := pool.QueryRow(ctx, `
 		SELECT
@@ -86,7 +87,8 @@ func GetRecurringSchedule(
 			next_run_at,
 			enabled,
 			catch_up_policy,
-			max_catch_up
+			max_catch_up,
+			cancelled_at
 		FROM recurring_schedules
 		WHERE id = $1
 	`, id).Scan(
@@ -100,6 +102,7 @@ func GetRecurringSchedule(
 		&s.Enabled,
 		&s.CatchUpPolicy,
 		&s.MaxCatchUp,
+		&cancelledAt,
 	)
 
 	if err != nil {
@@ -115,7 +118,7 @@ func GetRecurringSchedule(
 	if cronExpression != nil {
 		s.CronExpression = *cronExpression
 	}
-
+	s.CancelledAt = cancelledAt
 	if timezone != nil {
 		s.Timezone = *timezone
 	}
@@ -140,7 +143,7 @@ func ClaimRecurringSchedule(
 
 	var s schedule.RecurringSchedule
 	var intervalSeconds int64
-
+	var cancelledAt *time.Time
 	var cronExpression *string
 	var timezone *string
 
@@ -155,7 +158,8 @@ func ClaimRecurringSchedule(
 		next_run_at,
 		enabled,
 		catch_up_policy,
-		max_catch_up
+		max_catch_up,
+		cancelled_at
 	FROM recurring_schedules
 	WHERE id = $1
 	FOR UPDATE
@@ -170,7 +174,24 @@ func ClaimRecurringSchedule(
 		&s.Enabled,
 		&s.CatchUpPolicy,
 		&s.MaxCatchUp,
+		&cancelledAt,
 	)
+
+	s.CancelledAt = cancelledAt
+
+	if s.CancelledAt != nil {
+		return schedule.RecurringSchedule{}, nil, fmt.Errorf(
+			"recurring schedule %d is permanently cancelled",
+			id,
+		)
+	}
+
+	if !s.Enabled {
+		return schedule.RecurringSchedule{}, nil, fmt.Errorf(
+			"recurring schedule %d is disabled",
+			id,
+		)
+	}
 
 	if err != nil {
 		return schedule.RecurringSchedule{}, nil, fmt.Errorf(
@@ -352,17 +373,51 @@ func ClaimRecurringSchedule(
 	return s, createdJobs, nil
 }
 
-func SetRecurringScheduleEnabled(
-	ctx context.Context,
-	pool *pgxpool.Pool,
-	id int64,
-	enabled bool,
-) error {
-	result, err := pool.Exec(ctx, `
+func SetRecurringScheduleEnabled(ctx context.Context, pool *pgxpool.Pool, id int64, enabled bool) error {
+	if id <= 0 {
+		return fmt.Errorf("recurring schedule ID must be positive")
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"begin recurring schedule update: %w",
+			err,
+		)
+	}
+
+	defer tx.Rollback(ctx)
+
+	var cancelledAt *time.Time
+
+	err = tx.QueryRow(ctx, `
+		SELECT cancelled_at
+		FROM recurring_schedules
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&cancelledAt)
+
+	if err != nil {
+		return fmt.Errorf(
+			"load recurring schedule %d: %w",
+			id,
+			err,
+		)
+	}
+
+	if cancelledAt != nil {
+		return fmt.Errorf(
+			"recurring schedule %d is permanently cancelled",
+			id,
+		)
+	}
+
+	_, err = tx.Exec(ctx, `
 		UPDATE recurring_schedules
 		SET enabled = $2
 		WHERE id = $1
 	`, id, enabled)
+
 	if err != nil {
 		return fmt.Errorf(
 			"update recurring schedule %d enabled state: %w",
@@ -371,15 +426,16 @@ func SetRecurringScheduleEnabled(
 		)
 	}
 
-	if result.RowsAffected() == 0 {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf(
-			"recurring schedule %d not found",
-			id,
+			"commit recurring schedule update: %w",
+			err,
 		)
 	}
 
 	return nil
 }
+
 func RescheduleIntervalSchedule(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -404,13 +460,22 @@ func RescheduleIntervalSchedule(
 	defer tx.Rollback(ctx)
 
 	var scheduleType string
+	var cancelledAt *time.Time
 
 	err = tx.QueryRow(ctx, `
-		SELECT schedule_type
-		FROM recurring_schedules
-		WHERE id = $1
-		FOR UPDATE
-	`, id).Scan(&scheduleType)
+    SELECT schedule_type, cancelled_at
+    FROM recurring_schedules
+    WHERE id = $1
+    FOR UPDATE
+`, id).Scan(&scheduleType, &cancelledAt)
+
+	if cancelledAt != nil {
+		return fmt.Errorf(
+			"recurring schedule %d is permanently cancelled",
+			id,
+		)
+	}
+
 	if err != nil {
 		return fmt.Errorf(
 			"load recurring schedule %d: %w",
@@ -467,14 +532,21 @@ func RescheduleCronSchedule(ctx context.Context, pool *pgxpool.Pool, id int64, c
 	defer tx.Rollback(ctx)
 
 	var scheduleType string
+	var cancelledAt *time.Time
 
-	err = tx.QueryRow(ctx,
-		`
-		SELECT schedule_type
-		FROM recurring_schedules
-		WHERE id = $1
-		FOR UPDATE
-	`, id).Scan(&scheduleType)
+	err = tx.QueryRow(ctx, `
+    SELECT schedule_type, cancelled_at
+    FROM recurring_schedules
+    WHERE id = $1
+    FOR UPDATE
+`, id).Scan(&scheduleType, &cancelledAt)
+
+	if cancelledAt != nil {
+		return fmt.Errorf(
+			"recurring schedule %d is permanently cancelled",
+			id,
+		)
+	}
 
 	if err != nil {
 		return fmt.Errorf(
@@ -525,4 +597,66 @@ func RescheduleCronSchedule(ctx context.Context, pool *pgxpool.Pool, id int64, c
 	}
 
 	return nil
+}
+
+func CancelRecurringSchedule(ctx context.Context, pool *pgxpool.Pool, id int64) error {
+
+	if id <= 0 {
+		return fmt.Errorf("recurring schedule ID must be positive")
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf(
+			"begin recurring schedule cancellation: %w",
+			err,
+		)
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock the schedule so cancellation cannot race with
+	// claiming, enabling, or another cancellation.
+	var scheduleID int64
+
+	err = tx.QueryRow(ctx, `
+		SELECT id
+		FROM recurring_schedules
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&scheduleID)
+
+	if err != nil {
+		return fmt.Errorf(
+			"load recurring schedule %d: %w",
+			id,
+			err,
+		)
+	}
+
+	// COALESCE preserves the original cancellation timestamp
+	// when the schedule has already been cancelled.
+	_, err = tx.Exec(ctx, `
+		UPDATE recurring_schedules
+		SET enabled = FALSE,
+		    cancelled_at = COALESCE(cancelled_at, NOW())
+		WHERE id = $1
+	`, id)
+
+	if err != nil {
+		return fmt.Errorf(
+			"cancel recurring schedule %d: %w",
+			id,
+			err,
+		)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf(
+			"commit recurring schedule cancellation: %w",
+			err,
+		)
+	}
+
+	return nil
+
 }

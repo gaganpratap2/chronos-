@@ -41,6 +41,7 @@ func writeRecurringScheduleError(
 		strings.Contains(message, "whole number of seconds") ||
 		strings.Contains(message, "not an interval schedule") ||
 		strings.Contains(message, "not a cron schedule") ||
+		strings.Contains(message, "permanently cancelled") ||
 		strings.Contains(message, "calculate next cron occurrence") {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -218,6 +219,47 @@ func rescheduleCronHandler(pool *pgxpool.Pool) http.HandlerFunc {
 			request.Timezone,
 		); err != nil {
 			writeRecurringScheduleError(w, "reschedule", err)
+			return
+		}
+
+		writeRecurringSchedule(w, r, pool, id, "retrieve")
+	}
+}
+
+func cancelRecurringScheduleHandler(
+	pool *pgxpool.Pool,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(
+				w,
+				"method not allowed",
+				http.StatusMethodNotAllowed,
+			)
+			return
+		}
+
+		id, err := recurringScheduleID(r)
+		if err != nil {
+			http.Error(
+				w,
+				err.Error(),
+				http.StatusBadRequest,
+			)
+			return
+		}
+
+		err = database.CancelRecurringSchedule(
+			r.Context(),
+			pool,
+			id,
+		)
+		if err != nil {
+			writeRecurringScheduleError(
+				w,
+				"cancel",
+				err,
+			)
 			return
 		}
 

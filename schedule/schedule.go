@@ -26,6 +26,7 @@ type RecurringSchedule struct {
 	Enabled        bool
 	CatchUpPolicy  CatchUpPolicy
 	MaxCatchUp     int
+	CancelledAt    *time.Time
 }
 
 type CatchUpPolicy string

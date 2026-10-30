@@ -256,6 +256,11 @@ func newRecurringScheduleHandlerTestMuxWithPool(
 		rescheduleCronHandler(pool),
 	)
 
+	mux.HandleFunc(
+		"DELETE /recurring-schedules/{id}",
+		cancelRecurringScheduleHandler(pool),
+	)
+
 	return mux
 }
 
@@ -760,5 +765,233 @@ func assertJSONResponse(
 			"expected valid JSON response, got %q",
 			response.Body.String(),
 		)
+	}
+}
+
+func TestCancelRecurringScheduleHandler(t *testing.T) {
+	pool := newRecurringScheduleHandlerTestPool(t)
+	scheduleID := createHandlerTestIntervalSchedule(t, pool)
+	mux := newRecurringScheduleHandlerTestMuxWithPool(pool)
+
+	path := fmt.Sprintf(
+		"/recurring-schedules/%d",
+		scheduleID,
+	)
+
+	// First cancellation request.
+	request := httptest.NewRequest(
+		http.MethodDelete,
+		path,
+		nil,
+	)
+	response := httptest.NewRecorder()
+
+	mux.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected status 200, got %d; body: %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+
+	assertJSONResponse(t, response)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	cancelled, err := database.GetRecurringSchedule(
+		ctx,
+		pool,
+		scheduleID,
+	)
+	if err != nil {
+		t.Fatalf("get cancelled schedule: %v", err)
+	}
+
+	if cancelled.Enabled {
+		t.Fatal("expected schedule to be disabled")
+	}
+
+	if cancelled.CancelledAt == nil {
+		t.Fatal("expected cancellation timestamp")
+	}
+
+	firstCancellation := *cancelled.CancelledAt
+
+	// Repeated DELETE request must be safe.
+	request = httptest.NewRequest(
+		http.MethodDelete,
+		path,
+		nil,
+	)
+	response = httptest.NewRecorder()
+
+	mux.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf(
+			"expected repeated cancellation to return 200, got %d; body: %s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+
+	assertJSONResponse(t, response)
+
+	cancelledAgain, err := database.GetRecurringSchedule(
+		ctx,
+		pool,
+		scheduleID,
+	)
+	if err != nil {
+		t.Fatalf("get schedule after repeated cancellation: %v", err)
+	}
+
+	if cancelledAgain.CancelledAt == nil {
+		t.Fatal("expected cancellation timestamp to remain present")
+	}
+
+	if !cancelledAgain.CancelledAt.Equal(firstCancellation) {
+		t.Fatalf(
+			"cancellation timestamp changed: first=%v, second=%v",
+			firstCancellation,
+			*cancelledAgain.CancelledAt,
+		)
+	}
+
+	if cancelledAgain.Enabled {
+		t.Fatal("expected schedule to remain disabled")
+	}
+}
+
+func TestCancelledRecurringScheduleCannotBeEnabledThroughAPI(t *testing.T) {
+	pool := newRecurringScheduleHandlerTestPool(t)
+	scheduleID := createHandlerTestIntervalSchedule(t, pool)
+	mux := newRecurringScheduleHandlerTestMuxWithPool(pool)
+
+	// Permanently cancel the schedule through the DELETE endpoint.
+	cancelRequest := httptest.NewRequest(
+		http.MethodDelete,
+		fmt.Sprintf("/recurring-schedules/%d", scheduleID),
+		nil,
+	)
+	cancelResponse := httptest.NewRecorder()
+
+	mux.ServeHTTP(cancelResponse, cancelRequest)
+
+	if cancelResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"expected cancellation status 200, got %d; body: %s",
+			cancelResponse.Code,
+			cancelResponse.Body.String(),
+		)
+	}
+
+	// Attempt to re-enable the permanently cancelled schedule.
+	enableRequest := httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf(
+			"/recurring-schedules/%d/enabled",
+			scheduleID,
+		),
+		strings.NewReader(`{"enabled":true}`),
+	)
+	enableResponse := httptest.NewRecorder()
+
+	mux.ServeHTTP(enableResponse, enableRequest)
+
+	if enableResponse.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"expected status 400, got %d; body: %s",
+			http.StatusBadRequest,
+			enableResponse.Body.String(),
+		)
+	}
+
+	// Verify the database still contains the permanent cancellation.
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	saved, err := database.GetRecurringSchedule(
+		ctx,
+		pool,
+		scheduleID,
+	)
+	if err != nil {
+		t.Fatalf("get cancelled schedule: %v", err)
+	}
+
+	if saved.Enabled {
+		t.Fatal("cancelled schedule must remain disabled")
+	}
+
+	if saved.CancelledAt == nil {
+		t.Fatal("expected cancellation timestamp to remain present")
+	}
+}
+
+func TestCancelRecurringScheduleHandlerErrorCases(t *testing.T) {
+	pool := newRecurringScheduleHandlerTestPool(t)
+	mux := newRecurringScheduleHandlerTestMuxWithPool(pool)
+
+	missingID := time.Now().UnixNano()
+
+	tests := []struct {
+		name           string
+		method         string
+		path           string
+		expectedStatus int
+	}{
+		{
+			name:           "invalid schedule ID",
+			method:         http.MethodDelete,
+			path:           "/recurring-schedules/not-a-number",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:   "nonexistent schedule",
+			method: http.MethodDelete,
+			path: fmt.Sprintf(
+				"/recurring-schedules/%d",
+				missingID,
+			),
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "incorrect HTTP method",
+			method:         http.MethodGet,
+			path:           "/recurring-schedules/123",
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				tc.method,
+				tc.path,
+				nil,
+			)
+			response := httptest.NewRecorder()
+
+			mux.ServeHTTP(response, request)
+
+			if response.Code != tc.expectedStatus {
+				t.Fatalf(
+					"expected status %d, got %d; body: %s",
+					tc.expectedStatus,
+					response.Code,
+					response.Body.String(),
+				)
+			}
+		})
 	}
 }
