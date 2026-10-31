@@ -919,6 +919,57 @@ func TestTwoWorkersExecuteDifferentJobsConcurrently(t *testing.T) {
 		finished: finished,
 	}
 
+	claimSpecificJob := func(
+		jobID int,
+		workerID string,
+	) func(context.Context) (job.Job, error) {
+
+		return func(claimCtx context.Context) (job.Job, error) {
+			var claimed job.Job
+
+			err := pool.QueryRow(
+				claimCtx,
+				`UPDATE jobs
+			 SET status = 'Running',
+			     worker_id = $2,
+			     lease_until = NOW() + INTERVAL '30 seconds',
+			     fencing_token = fencing_token + 1
+			 WHERE id = $1
+			   AND status = 'Pending'
+			 RETURNING
+			     id,
+			     name,
+			     status,
+			     run_at,
+			     retry_count,
+			     max_retries,
+			     next_retry_at,
+			     worker_id,
+			     lease_until,
+			     fencing_token`,
+				jobID,
+				workerID,
+			).Scan(
+				&claimed.ID,
+				&claimed.Name,
+				&claimed.Status,
+				&claimed.RunAt,
+				&claimed.RetryCount,
+				&claimed.MaxRetries,
+				&claimed.NextRetryAt,
+				&claimed.WorkerID,
+				&claimed.LeaseUntil,
+				&claimed.FencingToken,
+			)
+
+			if err != nil {
+				return job.Job{}, err
+			}
+
+			return claimed, nil
+		}
+	}
+
 	workerA := &Worker{
 		Pool:    pool,
 		Handler: handler,
@@ -932,12 +983,18 @@ func TestTwoWorkersExecuteDifferentJobsConcurrently(t *testing.T) {
 	results := make(chan error, 2)
 
 	go func() {
-		_, err := workerA.RunOnce(ctx)
+		_, err := workerA.runOnce(
+			ctx,
+			claimSpecificJob(job1.ID, "test-worker-A"),
+		)
 		results <- err
 	}()
 
 	go func() {
-		_, err := workerB.RunOnce(ctx)
+		_, err := workerB.runOnce(
+			ctx,
+			claimSpecificJob(job2.ID, "test-worker-B"),
+		)
 		results <- err
 	}()
 

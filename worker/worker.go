@@ -52,21 +52,45 @@ PostgreSQL says Completed
 // execute only one job
 
 func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
+	return w.runOnce(ctx, func(claimCtx context.Context) (job.Job, error) {
+		return database.ClaimNextJob(
+			claimCtx,
+			w.Pool,
+			w.WorkerID,
+		)
+	})
+}
+
+// runOnce executes one claimed job.
+// The claimJob function allows tests to provide a deterministic job.
+func (w *Worker) runOnce(
+	ctx context.Context,
+	claimJob func(context.Context) (job.Job, error),
+) (bool, error) {
+
 	if w.Pool == nil {
 		return false, errors.New("worker database pool is nil")
 	}
+
 	if w.Handler == nil {
 		return false, errors.New("worker handler is nil")
 	}
 
-	j, err := database.ClaimNextJob(ctx, w.Pool, w.WorkerID)
+	if claimJob == nil {
+		return false, errors.New("worker claim function is nil")
+	}
+
+	// Step 1: Claim a job.
+	j, err := claimJob(ctx)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
+
 		return false, fmt.Errorf("claim job: %w", err)
 	}
 
+	// Step 2: Start the heartbeat.
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	heartbeatErrCh := make(chan error, 1)
 
@@ -84,15 +108,14 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		heartbeatErrCh <- heartbeatErr
 	}()
 
-	// Execute the handler exactly once, using the heartbeat context.
+	// Step 3: Execute the handler.
 	executionErr := w.Handler.Execute(heartbeatCtx, j)
 
-	// Stop the heartbeat and wait for it to exit.
+	// Step 4: Stop the heartbeat and wait for it to exit.
 	heartbeatCancel()
 	heartbeatErr := <-heartbeatErrCh
 
-	// If the heartbeat failed, do not write a job status
-	// using ownership that may no longer be valid.
+	// Step 5: Verify that ownership remained valid.
 	if heartbeatErr != nil {
 		return true, fmt.Errorf(
 			"job %d heartbeat failed; ownership could not be confirmed: %w",
@@ -105,7 +128,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		return true, ctx.Err()
 	}
 
-	// Handle execution failure using the existing retry logic.
+	// Step 6: Handle execution failure.
 	if executionErr != nil {
 		_, statusErr := database.TransitionJobStatus(
 			ctx,
@@ -114,6 +137,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 			"Failed",
 			j.FencingToken,
 		)
+
 		if statusErr != nil {
 			return true, fmt.Errorf(
 				"job %d execution failed: %v; recording failure: %w",
@@ -130,6 +154,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 			w.RetryPolicy,
 			j.FencingToken,
 		)
+
 		if retryErr != nil {
 			if errors.Is(retryErr, job.ErrRetriesExhausted) {
 				return true, fmt.Errorf(
@@ -149,7 +174,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	// The handler succeeded. Mark the job completed.
+	// Step 7: Mark the job completed.
 	_, err = database.TransitionJobStatus(
 		ctx,
 		w.Pool,
@@ -157,6 +182,7 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		"Completed",
 		j.FencingToken,
 	)
+
 	if err != nil {
 		return true, fmt.Errorf(
 			"mark job %d completed: %w",

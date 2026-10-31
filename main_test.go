@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -12,9 +11,6 @@ import (
 	"chronos/database"
 	"github.com/joho/godotenv"
 )
-
-
-
 
 func TestHealthHandler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -33,12 +29,13 @@ func TestHealthHandler(t *testing.T) {
 
 func TestJobAPI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(
-		context.Background(), 10*time.Second,
+		context.Background(),
+		15*time.Second,
 	)
 	defer cancel()
 
 	if err := godotenv.Load(); err != nil {
-    	t.Log(".env not found; using system environment variables")
+		t.Log(".env not found; using system environment variables")
 	}
 
 	pool, err := database.Connect(ctx)
@@ -48,95 +45,264 @@ func TestJobAPI(t *testing.T) {
 	defer pool.Close()
 
 	const testID = 987655
+	const testKey = "api-test-key-987655"
+	const differentKey = "api-test-key-987655-different"
 
-	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
+	// Clean up previous idempotency records first.
+	_, err = pool.Exec(
+		ctx,
+		`DELETE FROM idempotency_records
+		 WHERE operation_scope = $1
+		   AND idempotency_key IN ($2, $3)`,
+		createJobOperationScope,
+		testKey,
+		differentKey,
+	)
+	if err != nil {
+		t.Fatalf("idempotency test cleanup failed: %v", err)
+	}
+
+	// Clean up the previous job.
+	_, err = pool.Exec(
+		ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
 	if err != nil {
 		t.Fatalf("test setup failed: %v", err)
 	}
-	defer pool.Exec(context.Background(),
-		"DELETE FROM jobs WHERE id = $1", testID)
+
+	// Cleanup after the test.
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+
+		// Delete idempotency records before deleting the job.
+		_, err := pool.Exec(
+			cleanupCtx,
+			`DELETE FROM idempotency_records
+			 WHERE operation_scope = $1
+			   AND idempotency_key IN ($2, $3)`,
+			createJobOperationScope,
+			testKey,
+			differentKey,
+		)
+		if err != nil {
+			t.Errorf("idempotency cleanup failed: %v", err)
+		}
+
+		_, err = pool.Exec(
+			cleanupCtx,
+			"DELETE FROM jobs WHERE id = $1",
+			testID,
+		)
+		if err != nil {
+			t.Errorf("job cleanup failed: %v", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jobs", createJobHandler(pool))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
 
-	// 1. Create a job.
+	// 1. Create a new job.
 	createReq := httptest.NewRequest(
 		http.MethodPost,
 		"/jobs",
-		strings.NewReader(`{"id":987655,"name":"api-test"}`),
+		strings.NewReader(
+			`{"id":987655,"name":"api-test"}`,
+		),
 	)
 	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Idempotency-Key", testKey)
 
 	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
 
 	if createRec.Code != http.StatusCreated {
-		t.Fatalf("create: expected 201, got %d: %s",
-			createRec.Code, createRec.Body.String())
+		t.Fatalf(
+			"create: expected 201, got %d: %s",
+			createRec.Code,
+			createRec.Body.String(),
+		)
 	}
 
-	// 2. Try creating the same ID again.
+	// 2. Retry the same request using the same key.
+	// Chronos must replay the original response.
 	duplicateReq := httptest.NewRequest(
 		http.MethodPost,
 		"/jobs",
-		strings.NewReader(`{"id":987655,"name":"api-test"}`),
+		strings.NewReader(
+			`{"id":987655,"name":"api-test"}`,
+		),
 	)
 	duplicateReq.Header.Set("Content-Type", "application/json")
+	duplicateReq.Header.Set("Idempotency-Key", testKey)
 
 	duplicateRec := httptest.NewRecorder()
 	mux.ServeHTTP(duplicateRec, duplicateReq)
 
-	if duplicateRec.Code != http.StatusConflict {
-		t.Errorf("duplicate: expected 409, got %d",
-			duplicateRec.Code)
+	if duplicateRec.Code != http.StatusCreated {
+		t.Fatalf(
+			"duplicate: expected replay status 201, got %d: %s",
+			duplicateRec.Code,
+			duplicateRec.Body.String(),
+		)
 	}
 
-	// 3. Retrieve the created job.
-	getReq := httptest.NewRequest(
-		http.MethodGet, "/jobs/987655", nil,
+	if duplicateRec.Body.String() != createRec.Body.String() {
+		t.Errorf(
+			"expected original response %q, got %q",
+			createRec.Body.String(),
+			duplicateRec.Body.String(),
+		)
+	}
+
+	// 3. Reuse the same key with a different payload.
+	// Chronos must reject it.
+	conflictReq := httptest.NewRequest(
+		http.MethodPost,
+		"/jobs",
+		strings.NewReader(
+			`{"id":987655,"name":"different-job"}`,
+		),
 	)
+	conflictReq.Header.Set("Content-Type", "application/json")
+	conflictReq.Header.Set("Idempotency-Key", testKey)
+
+	conflictRec := httptest.NewRecorder()
+	mux.ServeHTTP(conflictRec, conflictReq)
+
+	if conflictRec.Code != http.StatusConflict {
+		t.Errorf(
+			"changed payload: expected 409, got %d: %s",
+			conflictRec.Code,
+			conflictRec.Body.String(),
+		)
+	}
+
+	// 4. Use a new key but an already existing job ID.
+	// PostgreSQL must reject the duplicate job ID.
+	duplicateIDReq := httptest.NewRequest(
+		http.MethodPost,
+		"/jobs",
+		strings.NewReader(
+			`{"id":987655,"name":"api-test"}`,
+		),
+	)
+	duplicateIDReq.Header.Set(
+		"Content-Type",
+		"application/json",
+	)
+	duplicateIDReq.Header.Set(
+		"Idempotency-Key",
+		differentKey,
+	)
+
+	duplicateIDRec := httptest.NewRecorder()
+	mux.ServeHTTP(duplicateIDRec, duplicateIDReq)
+
+	if duplicateIDRec.Code != http.StatusConflict {
+		t.Errorf(
+			"duplicate job ID: expected 409, got %d: %s",
+			duplicateIDRec.Code,
+			duplicateIDRec.Body.String(),
+		)
+	}
+
+	// 5. Retrieve the created job.
+	getReq := httptest.NewRequest(
+		http.MethodGet,
+		"/jobs/987655",
+		nil,
+	)
+
 	getRec := httptest.NewRecorder()
 	mux.ServeHTTP(getRec, getReq)
 
 	if getRec.Code != http.StatusOK {
-		t.Fatalf("get: expected 200, got %d: %s",
-			getRec.Code, getRec.Body.String())
+		t.Fatalf(
+			"get: expected 200, got %d: %s",
+			getRec.Code,
+			getRec.Body.String(),
+		)
 	}
 
-	if !strings.Contains(getRec.Body.String(), `"Name":"api-test"`) {
-		t.Errorf("unexpected job response: %s", getRec.Body.String())
+	if !strings.Contains(
+		getRec.Body.String(),
+		`"Name":"api-test"`,
+	) {
+		t.Errorf(
+			"unexpected job response: %s",
+			getRec.Body.String(),
+		)
 	}
 
-	// 4. Send invalid JSON.
+	// 6. Send invalid JSON with an idempotency key.
 	invalidReq := httptest.NewRequest(
 		http.MethodPost,
 		"/jobs",
 		strings.NewReader(`{invalid-json}`),
 	)
 	invalidReq.Header.Set("Content-Type", "application/json")
+	invalidReq.Header.Set(
+		"Idempotency-Key",
+		"invalid-json-test-key",
+	)
 
 	invalidRec := httptest.NewRecorder()
 	mux.ServeHTTP(invalidRec, invalidReq)
 
 	if invalidRec.Code != http.StatusBadRequest {
-		t.Errorf("invalid JSON: expected 400, got %d",
-			invalidRec.Code)
+		t.Errorf(
+			"invalid JSON: expected 400, got %d",
+			invalidRec.Code,
+		)
 	}
 
-	// 5. Request a missing job.
-	missingReq := httptest.NewRequest(
-		http.MethodGet, "/jobs/999999", nil,
+	// 7. Send a valid request without an idempotency key.
+	missingKeyReq := httptest.NewRequest(
+		http.MethodPost,
+		"/jobs",
+		strings.NewReader(
+			`{"id":987699,"name":"missing-key-test"}`,
+		),
 	)
+	missingKeyReq.Header.Set(
+		"Content-Type",
+		"application/json",
+	)
+
+	missingKeyRec := httptest.NewRecorder()
+	mux.ServeHTTP(missingKeyRec, missingKeyReq)
+
+	if missingKeyRec.Code != http.StatusBadRequest {
+		t.Errorf(
+			"missing key: expected 400, got %d",
+			missingKeyRec.Code,
+		)
+	}
+
+	// 8. Request a job that does not exist.
+	missingReq := httptest.NewRequest(
+		http.MethodGet,
+		"/jobs/999999",
+		nil,
+	)
+
 	missingRec := httptest.NewRecorder()
 	mux.ServeHTTP(missingRec, missingReq)
 
 	if missingRec.Code != http.StatusNotFound {
-		t.Errorf("missing job: expected 404, got %d",
-			missingRec.Code)
+		t.Errorf(
+			"missing job: expected 404, got %d",
+			missingRec.Code,
+		)
 	}
 }
-
 
 func TestTransitionJobAPI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(
@@ -145,7 +311,7 @@ func TestTransitionJobAPI(t *testing.T) {
 	defer cancel()
 
 	if err := godotenv.Load(); err != nil {
-    	t.Log(".env not found; using system environment variables")
+		t.Log(".env not found; using system environment variables")
 	}
 
 	pool, err := database.Connect(ctx)
@@ -155,13 +321,69 @@ func TestTransitionJobAPI(t *testing.T) {
 	defer pool.Close()
 
 	const testID = 987656
+	const testKey = "transition-test-key-987656"
 
 	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
 	if err != nil {
 		t.Fatalf("test setup failed: %v", err)
 	}
-	defer pool.Exec(context.Background(),
-		"DELETE FROM jobs WHERE id = $1", testID)
+
+	_, err = pool.Exec(
+		ctx,
+		`DELETE FROM idempotency_records
+     WHERE operation_scope = $1
+       AND idempotency_key = $2`,
+		createJobOperationScope,
+		testKey,
+	)
+
+	if err != nil {
+		t.Fatalf("idempotency cleanup failed: %v", err)
+	}
+
+	_, err = pool.Exec(
+		ctx,
+		"DELETE FROM jobs WHERE id = $1",
+		testID,
+	)
+
+	if err != nil {
+		t.Fatalf("test setup failed: %v", err)
+	}
+
+	// defer pool.Exec(context.Background(),
+	// 	"DELETE FROM jobs WHERE id = $1", testID)
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+
+		// Delete the referencing idempotency record first.
+		_, err := pool.Exec(
+			cleanupCtx,
+			`DELETE FROM idempotency_records
+         WHERE operation_scope = $1
+           AND idempotency_key = $2`,
+			createJobOperationScope,
+			testKey,
+		)
+		if err != nil {
+			t.Errorf("idempotency cleanup failed: %v", err)
+		}
+
+		// Now delete the job.
+		_, err = pool.Exec(
+			cleanupCtx,
+			"DELETE FROM jobs WHERE id = $1",
+			testID,
+		)
+		if err != nil {
+			t.Errorf("job cleanup failed: %v", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/jobs", createJobHandler(pool))
@@ -180,6 +402,7 @@ func TestTransitionJobAPI(t *testing.T) {
 		),
 	)
 	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Idempotency-Key", testKey)
 
 	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
@@ -239,32 +462,6 @@ func TestTransitionJobAPI(t *testing.T) {
 			getRec.Body.String())
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // package main
 
