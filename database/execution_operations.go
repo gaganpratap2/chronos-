@@ -151,6 +151,48 @@ func validateExecutionOperationInput(pool *pgxpool.Pool, input ExecutionOperatio
 	return nil
 }
 
+func lockWorkflowTaskJob(
+	ctx context.Context,
+	tx pgx.Tx,
+	workflowTaskID int64,
+) (int64, string, error) {
+
+	var fencingToken int64
+	var status string
+
+	err := tx.QueryRow(
+		ctx,
+		`SELECT
+			j.fencing_token,
+			j.status
+		 FROM workflow_tasks wt
+		 JOIN jobs j
+		   ON j.id = wt.job_id
+		 WHERE wt.id = $1
+		 FOR UPDATE OF wt, j`,
+		workflowTaskID,
+	).Scan(
+		&fencingToken,
+		&status,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "", fmt.Errorf(
+			"%w: workflow task or linked job not found",
+			ErrInvalidExecutionOperation,
+		)
+	}
+
+	if err != nil {
+		return 0, "", fmt.Errorf(
+			"lock workflow task job: %w",
+			err,
+		)
+	}
+
+	return fencingToken, status, nil
+}
+
 // ReserveExecutionOperation creates a new execution operation.
 // If the logical operation already exists with identical parameters,
 // it returns the existing record without creating another one.
@@ -860,46 +902,4 @@ func beginOwnedExecutionOperation(ctx context.Context, pool *pgxpool.Pool, opera
 	}
 
 	return tx, operation, nil
-}
-
-func lockWorkflowTaskJob(
-	ctx context.Context,
-	tx pgx.Tx,
-	workflowTaskID int64,
-) (int64, string, error) {
-
-	var fencingToken int64
-	var status string
-
-	err := tx.QueryRow(
-		ctx,
-		`SELECT
-			j.fencing_token,
-			j.status
-		 FROM workflow_tasks wt
-		 JOIN jobs j
-		   ON j.id = wt.job_id
-		 WHERE wt.id = $1
-		 FOR UPDATE OF wt, j`,
-		workflowTaskID,
-	).Scan(
-		&fencingToken,
-		&status,
-	)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, "", fmt.Errorf(
-			"%w: workflow task or linked job not found",
-			ErrInvalidExecutionOperation,
-		)
-	}
-
-	if err != nil {
-		return 0, "", fmt.Errorf(
-			"lock workflow task job: %w",
-			err,
-		)
-	}
-
-	return fencingToken, status, nil
 }

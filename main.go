@@ -1,6 +1,7 @@
 package main
 
 import (
+	"chronos/execution"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -335,12 +336,95 @@ func transitionJobStatusHandler(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+// type AppHandler struct{}
+
+// func (h AppHandler) Execute(ctx context.Context, j job.Job) error {
+// 	log.Printf("Executing job %d: %s", j.ID, j.Name)
+// 	return nil
+// }
+
 type AppHandler struct{}
 
-func (h AppHandler) Execute(ctx context.Context, j job.Job) error {
-	log.Printf("Executing job %d: %s", j.ID, j.Name)
+const (
+	appJobOperationName = "execute-job"
+	appJobProvider      = "development"
+)
+
+func (h AppHandler) Execute(
+	ctx context.Context,
+	j job.Job,
+) error {
+	// Standalone jobs retain their existing execution path.
+	log.Printf("Executing standalone job %d: %s", j.ID, j.Name)
 	return nil
 }
+
+func (h AppHandler) ExecuteWithOperations(
+	ctx context.Context,
+	j job.Job,
+	execContext worker.OperationExecutionContext,
+) error {
+	if execContext.Operations == nil {
+		return errors.New("operation executor is nil")
+	}
+
+	if execContext.WorkflowTaskID <= 0 {
+		return errors.New("invalid workflow task ID")
+	}
+
+	if execContext.FencingToken <= 0 {
+		return errors.New("invalid fencing token")
+	}
+
+	// Build a deterministic payload for this logical job operation.
+	payload, err := json.Marshal(struct {
+		JobID   int    `json:"job_id"`
+		JobName string `json:"job_name"`
+	}{
+		JobID:   j.ID,
+		JobName: j.Name,
+	})
+	if err != nil {
+		return fmt.Errorf("encode job operation payload: %w", err)
+	}
+
+	// This key remains unchanged across retries of this workflow task.
+	idempotencyKey := fmt.Sprintf(
+		"chronos:workflow-task:%d:%s",
+		execContext.WorkflowTaskID,
+		appJobOperationName,
+	)
+
+	result, err := execContext.Operations.Execute(
+		ctx,
+		execution.OperationRequest{
+			WorkflowTaskID: execContext.WorkflowTaskID,
+			OperationName:  appJobOperationName,
+			Provider:       appJobProvider,
+			IdempotencyKey: idempotencyKey,
+			FencingToken:   execContext.FencingToken,
+			Payload:        payload,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"execute operation for workflow task %d: %w",
+			execContext.WorkflowTaskID,
+			err,
+		)
+	}
+
+	log.Printf(
+		"Workflow task %d operation completed: provider_reference=%s replayed=%t",
+		execContext.WorkflowTaskID,
+		result.ProviderReference,
+		result.Replayed,
+	)
+
+	return nil
+}
+
+var _ worker.OperationAwareHandler = AppHandler{}
 
 func main() {
 	if err := godotenv.Load(); err != nil {
@@ -366,14 +450,30 @@ func main() {
 		log.Fatalf("failed to get hostname: %v", err)
 	}
 
+	developmentProvider, err := execution.NewDevelopmentProvider(pool)
+	if err != nil {
+		log.Fatalf("create development provider: %v", err)
+	}
+
+	operationService, err := execution.NewOperationService(
+		pool,
+		map[string]execution.Provider{
+			appJobProvider: developmentProvider,
+		},
+	)
+	if err != nil {
+		log.Fatalf("create operation service: %v", err)
+	}
+
 	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
 	log.Printf("Starting worker with ID: %s", workerID)
 
 	w := &worker.Worker{
-		WorkerID:     workerID,
-		Pool:         pool,
-		Handler:      appHandler,
-		PollInterval: 500 * time.Millisecond,
+		WorkerID:          workerID,
+		Pool:              pool,
+		Handler:           appHandler,
+		OperationExecutor: operationService,
+		PollInterval:      500 * time.Millisecond,
 	}
 
 	workerCtx, workerCancel := signal.NotifyContext(

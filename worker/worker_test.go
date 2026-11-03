@@ -9,6 +9,7 @@ import (
 	"chronos/database"
 	"chronos/job"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 )
 
@@ -28,6 +29,25 @@ type concurrentHandler struct {
 	start    <-chan struct{}
 	finished chan<- struct{}
 }
+
+type operationAwareTestHandler struct{}
+
+func (h *operationAwareTestHandler) Execute(
+	ctx context.Context,
+	j job.Job,
+) error {
+	return nil
+}
+
+func (h *operationAwareTestHandler) ExecuteWithOperations(
+	ctx context.Context,
+	j job.Job,
+	execContext OperationExecutionContext,
+) error {
+	return nil
+}
+
+var _ OperationAwareHandler = (*operationAwareTestHandler)(nil)
 
 func (h *concurrentHandler) Execute(ctx context.Context, j job.Job) error {
 	<-h.start
@@ -1391,10 +1411,57 @@ func TestWorkerStopsWhenHeartbeatLosesOwnership(t *testing.T) {
 		err       error
 	}
 
+	claimSpecificJob := func(
+		claimCtx context.Context,
+	) (job.Job, error) {
+		var claimed job.Job
+
+		err := pool.QueryRow(
+			claimCtx,
+			`UPDATE jobs
+		 SET status = 'Running',
+		     worker_id = $2,
+		     lease_until = NOW() + INTERVAL '30 seconds',
+		     fencing_token = fencing_token + 1
+		 WHERE id = $1
+		   AND status = 'Pending'
+		 RETURNING
+		     id,
+		     name,
+		     status,
+		     run_at,
+		     retry_count,
+		     max_retries,
+		     next_retry_at,
+		     worker_id,
+		     lease_until,
+		     fencing_token`,
+			jobID,
+			w.WorkerID,
+		).Scan(
+			&claimed.ID,
+			&claimed.Name,
+			&claimed.Status,
+			&claimed.RunAt,
+			&claimed.RetryCount,
+			&claimed.MaxRetries,
+			&claimed.NextRetryAt,
+			&claimed.WorkerID,
+			&claimed.LeaseUntil,
+			&claimed.FencingToken,
+		)
+
+		if err != nil {
+			return job.Job{}, err
+		}
+
+		return claimed, nil
+	}
+
 	resultCh := make(chan outcome, 1)
 
 	go func() {
-		processed, runErr := w.RunOnce(ctx)
+		processed, runErr := w.runOnce(ctx, claimSpecificJob)
 		resultCh <- outcome{
 			processed: processed,
 			err:       runErr,
@@ -1459,5 +1526,39 @@ func TestWorkerStopsWhenHeartbeatLosesOwnership(t *testing.T) {
 
 	if fencingToken != 2 {
 		t.Fatalf("expected fencing token 2, got %d", fencingToken)
+	}
+}
+
+func TestWorkerRejectsOperationAwareHandlerWithoutExecutor(t *testing.T) {
+	w := &Worker{
+		Pool:    &pgxpool.Pool{},
+		Handler: &operationAwareTestHandler{},
+	}
+
+	claimCalled := false
+
+	ran, err := w.runOnce(
+		context.Background(),
+		func(ctx context.Context) (job.Job, error) {
+			claimCalled = true
+			return job.Job{}, nil
+		},
+	)
+
+	if err == nil {
+		t.Fatal("expected error when operation executor is missing")
+	}
+
+	if ran {
+		t.Fatal("expected no job to run")
+	}
+
+	if claimCalled {
+		t.Fatal("worker should reject missing executor before claiming a job")
+	}
+
+	expected := "operation-aware handler requires an operation executor"
+	if err.Error() != expected {
+		t.Fatalf("expected error %q, got %q", expected, err)
 	}
 }

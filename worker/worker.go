@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"chronos/database"
+	"chronos/execution"
 	"chronos/job"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,22 @@ type Handler interface {
 	Execute(ctx context.Context, j job.Job) error
 }
 
+type OperationExecutionContext struct {
+	WorkflowTaskID int64
+	FencingToken   int64
+	Operations     execution.OperationExecutor
+}
+
+type OperationAwareHandler interface {
+	Handler
+
+	ExecuteWithOperations(
+		ctx context.Context,
+		j job.Job,
+		execContext OperationExecutionContext,
+	) error
+}
+
 type Worker struct {
 	WorkerID          string
 	Pool              *pgxpool.Pool
@@ -25,6 +42,7 @@ type Worker struct {
 	PollInterval      time.Duration
 	RetryPolicy       job.RetryPolicy
 	HeartbeatInterval time.Duration
+	OperationExecutor execution.OperationExecutor
 }
 
 // The Worker is responsible for picking up jobs and managing their execution. The Handler is responsible for actually doing the job.
@@ -80,6 +98,14 @@ func (w *Worker) runOnce(
 		return false, errors.New("worker claim function is nil")
 	}
 
+	operationHandler, operationAware := w.Handler.(OperationAwareHandler)
+
+	if operationAware && w.OperationExecutor == nil {
+		return false, errors.New(
+			"operation-aware handler requires an operation executor",
+		)
+	}
+
 	// Step 1: Claim a job.
 	j, err := claimJob(ctx)
 	if err != nil {
@@ -109,7 +135,42 @@ func (w *Worker) runOnce(
 	}()
 
 	// Step 3: Execute the handler.
-	executionErr := w.Handler.Execute(heartbeatCtx, j)
+	var executionErr error
+
+	if operationAware {
+		workflowTaskID, lookupErr := database.GetWorkflowTaskIDByJobID(
+			heartbeatCtx,
+			w.Pool,
+			j.ID,
+		)
+
+		switch {
+		case errors.Is(lookupErr, database.ErrNoWorkflowTaskForJob):
+			// Standalone jobs do not participate in workflow-level
+			// execution idempotency.
+			executionErr = w.Handler.Execute(heartbeatCtx, j)
+
+		case lookupErr != nil:
+			executionErr = fmt.Errorf(
+				"load workflow task for job %d: %w",
+				j.ID,
+				lookupErr,
+			)
+
+		default:
+			executionErr = operationHandler.ExecuteWithOperations(
+				heartbeatCtx,
+				j,
+				OperationExecutionContext{
+					WorkflowTaskID: workflowTaskID,
+					FencingToken:   j.FencingToken,
+					Operations:     w.OperationExecutor,
+				},
+			)
+		}
+	} else {
+		executionErr = w.Handler.Execute(heartbeatCtx, j)
+	}
 
 	// Step 4: Stop the heartbeat and wait for it to exit.
 	heartbeatCancel()
@@ -137,7 +198,6 @@ func (w *Worker) runOnce(
 			"Failed",
 			j.FencingToken,
 		)
-
 		if statusErr != nil {
 			return true, fmt.Errorf(
 				"job %d execution failed: %v; recording failure: %w",
@@ -147,6 +207,13 @@ func (w *Worker) runOnce(
 			)
 		}
 
+		// A confirmed provider failure is terminal.
+		// Do not schedule another retry for this logical operation.
+		if errors.Is(executionErr, execution.ErrOperationFailed) {
+			return true, nil
+		}
+
+		// Other execution errors remain eligible for retry.
 		_, retryErr := database.RetryJob(
 			ctx,
 			w.Pool,
@@ -154,7 +221,6 @@ func (w *Worker) runOnce(
 			w.RetryPolicy,
 			j.FencingToken,
 		)
-
 		if retryErr != nil {
 			if errors.Is(retryErr, job.ErrRetriesExhausted) {
 				return true, fmt.Errorf(
