@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -555,6 +556,140 @@ func TestOperationServiceDoesNotRepeatProcessingOperation(t *testing.T) {
 	}
 }
 
+// Test recovery when a worker crashes after reserving an operation
+// but before calling the provider.
+func TestOperationServiceRecoversAbandonedProcessingOperationSafely(
+	t *testing.T,
+) {
+	f := newServiceFixture(t)
+
+	payload := []byte(`{"amount":1000,"currency":"INR"}`)
+
+	// Worker A creates the logical operation reservation.
+	request := f.request(
+		"charge-payment",
+		"payment-crash-before-provider",
+		"payment-provider",
+		payload,
+	)
+
+	operation, created, err := database.ReserveExecutionOperation(
+		f.ctx,
+		f.pool,
+		f.databaseInput(request),
+	)
+	if err != nil {
+		t.Fatalf("reserve operation: %v", err)
+	}
+
+	if !created {
+		t.Fatal("expected Worker A to create the reservation")
+	}
+
+	// Worker A crashes here.
+	// Its provider Execute method is never called.
+
+	// Simulate Worker B claiming the job with a newer fencing token.
+	newToken := f.fencingToken + 1
+
+	tag, err := f.pool.Exec(
+		f.ctx,
+		`UPDATE jobs
+		 SET fencing_token = $2,
+		     worker_id = 'worker-b'
+		 WHERE id = $1`,
+		f.jobID,
+		newToken,
+	)
+	if err != nil {
+		t.Fatalf("transfer job ownership: %v", err)
+	}
+
+	if tag.RowsAffected() != 1 {
+		t.Fatal("expected job ownership to be updated")
+	}
+
+	// The provider cannot find the operation.
+	// This is not sufficient proof that the operation never happened.
+	provider := &mockProvider{
+		lookupResult: ProviderResult{
+			Outcome: ProviderNotFound,
+		},
+	}
+
+	service, err := NewOperationService(
+		f.pool,
+		map[string]Provider{
+			"payment-provider": provider,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create operation service: %v", err)
+	}
+
+	// Worker B uses the same logical operation and idempotency key,
+	// but carries its new fencing token.
+	request.FencingToken = newToken
+
+	_, err = service.Execute(f.ctx, request)
+
+	if !errors.Is(err, ErrOperationOutcomeUnknown) {
+		t.Fatalf(
+			"expected ErrOperationOutcomeUnknown, got %v",
+			err,
+		)
+	}
+
+	executeCalls, lookupCalls := provider.calls()
+
+	if executeCalls != 0 {
+		t.Fatalf(
+			"expected zero provider Execute calls, got %d",
+			executeCalls,
+		)
+	}
+
+	if lookupCalls != 1 {
+		t.Fatalf(
+			"expected one provider Lookup call, got %d",
+			lookupCalls,
+		)
+	}
+
+	// Verify that the existing operation was taken over,
+	// but remains unresolved.
+	recovered, err := database.GetExecutionOperation(
+		f.ctx,
+		f.pool,
+		operation.ID,
+	)
+	if err != nil {
+		t.Fatalf("get recovered operation: %v", err)
+	}
+
+	if recovered.Status != "outcome_unknown" {
+		t.Fatalf(
+			"expected outcome_unknown, got %q",
+			recovered.Status,
+		)
+	}
+
+	if recovered.FencingToken != newToken {
+		t.Fatalf(
+			"expected fencing token %d, got %d",
+			newToken,
+			recovered.FencingToken,
+		)
+	}
+
+	if recovered.AttemptCount != 2 {
+		t.Fatalf(
+			"expected attempt count 2, got %d",
+			recovered.AttemptCount,
+		)
+	}
+}
+
 // Test that a worker with an old fencing token is rejected.
 func TestOperationServiceRejectsStaleWorker(t *testing.T) {
 	f := newServiceFixture(t)
@@ -890,5 +1025,461 @@ func TestMarkUnknownPersistsAfterContextCancellation(t *testing.T) {
 			"expected outcome_unknown, got %s",
 			saved.Status,
 		)
+	}
+}
+
+func TestOperationServiceRecoversAfterDatabaseCompletionFailure(t *testing.T) {
+	f := newServiceFixture(t)
+
+	request := f.request(
+		"charge-payment",
+		"payment-db-failure-100",
+		"payment-provider",
+		[]byte(`{"amount":1000,"currency":"INR"}`),
+	)
+
+	providerResult := ProviderResult{
+		Outcome:           ProviderSucceeded,
+		ProviderReference: "PAY-DB-FAILURE-100",
+		Data:              []byte(`{"status":"SUCCESS"}`),
+	}
+
+	provider := &mockProvider{
+		result:       providerResult,
+		lookupResult: providerResult,
+	}
+
+	service, err := NewOperationService(
+		f.pool,
+		map[string]Provider{
+			"payment-provider": provider,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create operation service: %v", err)
+	}
+
+	// Install a trigger that rejects successful completion
+	// only for this fixture's workflow task.
+	functionSQL := fmt.Sprintf(`
+		CREATE FUNCTION chronos_test_reject_operation_success()
+		RETURNS TRIGGER AS $$
+		BEGIN
+			IF NEW.workflow_task_id = %d
+				AND NEW.status = 'succeeded'
+				AND OLD.status <> 'succeeded' THEN
+				RAISE EXCEPTION 'simulated completion persistence failure';
+			END IF;
+
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql
+	`, f.taskID)
+
+	_, err = f.pool.Exec(f.ctx, functionSQL)
+	if err != nil {
+		t.Fatalf("create failure trigger function: %v", err)
+	}
+
+	_, err = f.pool.Exec(
+		f.ctx,
+		`CREATE TRIGGER chronos_test_reject_operation_success_trigger
+		BEFORE UPDATE ON execution_operations
+		FOR EACH ROW
+		EXECUTE FUNCTION chronos_test_reject_operation_success()`,
+	)
+	if err != nil {
+		_, _ = f.pool.Exec(
+			f.ctx,
+			`DROP FUNCTION IF EXISTS chronos_test_reject_operation_success()`,
+		)
+		t.Fatalf("create failure trigger: %v", err)
+	}
+
+	triggerInstalled := true
+
+	dropFailureTrigger := func(ctx context.Context) error {
+		_, err := f.pool.Exec(
+			ctx,
+			`DROP TRIGGER IF EXISTS
+			chronos_test_reject_operation_success_trigger
+			ON execution_operations`,
+		)
+		if err != nil {
+			return err
+		}
+
+		_, err = f.pool.Exec(
+			ctx,
+			`DROP FUNCTION IF EXISTS
+			chronos_test_reject_operation_success()`,
+		)
+		return err
+	}
+
+	// Ensure the trigger is removed even if the test fails.
+	t.Cleanup(func() {
+		if !triggerInstalled {
+			return
+		}
+
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cancel()
+
+		if err := dropFailureTrigger(cleanupCtx); err != nil {
+			t.Errorf("remove failure trigger: %v", err)
+		}
+	})
+
+	// Worker A: provider succeeds, but PostgreSQL rejects
+	// persistence of the successful result.
+	_, err = service.Execute(f.ctx, request)
+	if err == nil {
+		t.Fatal("expected database completion failure")
+	}
+
+	executeCalls, lookupCalls := provider.calls()
+
+	if executeCalls != 1 {
+		t.Fatalf("expected 1 provider execution, got %d", executeCalls)
+	}
+
+	if lookupCalls != 0 {
+		t.Fatalf("expected 0 provider lookups, got %d", lookupCalls)
+	}
+
+	// Find the actual operation ID created by Worker A.
+	var operationID int64
+
+	err = f.pool.QueryRow(
+		f.ctx,
+		`SELECT id
+		 FROM execution_operations
+		 WHERE workflow_task_id = $1
+		   AND operation_name = $2`,
+		request.WorkflowTaskID,
+		request.OperationName,
+	).Scan(&operationID)
+	if err != nil {
+		t.Fatalf("find execution operation: %v", err)
+	}
+
+	// The failed transaction must not have committed success.
+	stored, err := database.GetExecutionOperation(
+		f.ctx,
+		f.pool,
+		operationID,
+	)
+	if err != nil {
+		t.Fatalf("get execution operation: %v", err)
+	}
+
+	// if stored.Status != "processing" {
+	// 	t.Fatalf(
+	// 		"expected processing after failed completion, got %s",
+	// 		stored.Status,
+	// 	)
+	// }
+
+	if stored.Status != "outcome_unknown" {
+		t.Fatalf("expected outcome_unknown after failed completion, got %s", stored.Status)
+	}
+
+	// Remove the trigger so recovery can persist the result.
+	if err := dropFailureTrigger(f.ctx); err != nil {
+		t.Fatalf("remove failure trigger before recovery: %v", err)
+	}
+	triggerInstalled = false
+
+	// Simulate Worker B taking ownership with a newer fencing token.
+	newToken := f.fencingToken + 1
+
+	_, err = f.pool.Exec(
+		f.ctx,
+		`UPDATE jobs
+		 SET worker_id = 'worker-b',
+		     fencing_token = $2,
+		     lease_until = NOW() + INTERVAL '30 minutes'
+		 WHERE id = $1`,
+		f.jobID,
+		newToken,
+	)
+	if err != nil {
+		t.Fatalf("transfer job ownership: %v", err)
+	}
+
+	request.FencingToken = newToken
+
+	// Worker B must reconcile using Lookup, not execute again.
+	recovered, err := service.Execute(f.ctx, request)
+	if err != nil {
+		t.Fatalf("recover operation: %v", err)
+	}
+
+	if !recovered.Replayed {
+		t.Fatal("expected recovered result to be marked as replayed")
+	}
+
+	if recovered.ProviderReference != providerResult.ProviderReference {
+		t.Fatalf(
+			"expected provider reference %s, got %s",
+			providerResult.ProviderReference,
+			recovered.ProviderReference,
+		)
+	}
+
+	if !bytes.Equal(recovered.Data, providerResult.Data) {
+		t.Fatal("recovered result does not match provider result")
+	}
+
+	executeCalls, lookupCalls = provider.calls()
+
+	if executeCalls != 1 {
+		t.Fatalf("expected provider execution count 1, got %d", executeCalls)
+	}
+
+	if lookupCalls != 1 {
+		t.Fatalf("expected provider lookup count 1, got %d", lookupCalls)
+	}
+
+	// Verify the final persisted operation.
+	finalOperation, err := database.GetExecutionOperation(
+		f.ctx,
+		f.pool,
+		operationID,
+	)
+	if err != nil {
+		t.Fatalf("get final execution operation: %v", err)
+	}
+
+	if finalOperation.Status != "succeeded" {
+		t.Fatalf("expected succeeded, got %s", finalOperation.Status)
+	}
+
+	if finalOperation.FencingToken != newToken {
+		t.Fatalf(
+			"expected fencing token %d, got %d",
+			newToken,
+			finalOperation.FencingToken,
+		)
+	}
+
+	if finalOperation.ProviderReference == nil ||
+		*finalOperation.ProviderReference != providerResult.ProviderReference {
+		t.Fatal("final provider reference was not persisted correctly")
+	}
+
+	if !bytes.Equal(finalOperation.Result, providerResult.Data) {
+		t.Fatal("final operation result was not persisted correctly")
+	}
+}
+
+func TestOldWorkerCannotCompleteOperationAfterTakeover(t *testing.T) {
+	f := newServiceFixture(t)
+
+	request := f.request(
+		"charge-payment",
+		"stale-completion-payment",
+		"payment-provider",
+		[]byte(`{"amount":1000}`),
+	)
+
+	operation, created, err := database.ReserveExecutionOperation(
+		f.ctx,
+		f.pool,
+		f.databaseInput(request),
+	)
+	if err != nil {
+		t.Fatalf("reserve operation: %v", err)
+	}
+
+	if !created {
+		t.Fatal("expected operation to be created")
+	}
+
+	// Simulate Worker B taking ownership.
+	newToken := f.fencingToken + 1
+
+	tag, err := f.pool.Exec(
+		f.ctx,
+		`UPDATE jobs
+		 SET fencing_token = $2,
+		     worker_id = 'worker-b'
+		 WHERE id = $1`,
+		f.jobID,
+		newToken,
+	)
+	if err != nil {
+		t.Fatalf("update job ownership: %v", err)
+	}
+
+	if tag.RowsAffected() != 1 {
+		t.Fatal("expected job ownership to be updated")
+	}
+
+	// Worker A attempts to complete using its old token.
+	providerReference := "PAY-STALE-WORKER"
+	result := []byte(`{"status":"SUCCESS"}`)
+
+	err = database.CompleteExecutionOperation(
+		f.ctx,
+		f.pool,
+		operation.ID,
+		f.fencingToken,
+		&providerReference,
+		result,
+	)
+
+	if !errors.Is(err, database.ErrExecutionOperationStaleToken) {
+		t.Fatalf(
+			"expected stale token error, got %v",
+			err,
+		)
+	}
+
+	// Verify Worker A did not modify the operation.
+	stored, err := database.GetExecutionOperation(
+		f.ctx,
+		f.pool,
+		operation.ID,
+	)
+	if err != nil {
+		t.Fatalf("get execution operation: %v", err)
+	}
+
+	if stored.Status != "processing" {
+		t.Fatalf(
+			"expected processing status, got %s",
+			stored.Status,
+		)
+	}
+
+	if stored.FencingToken != f.fencingToken {
+		t.Fatalf(
+			"expected operation token %d, got %d",
+			f.fencingToken,
+			stored.FencingToken,
+		)
+	}
+
+	if stored.ProviderReference != nil {
+		t.Fatalf(
+			"expected no provider reference, got %s",
+			*stored.ProviderReference,
+		)
+	}
+}
+
+func TestOperationServiceKeepsUnknownOutcomeWhenProviderCannotConfirm(t *testing.T) {
+	tests := []struct {
+		name         string
+		lookupResult ProviderResult
+		lookupErr    error
+	}{
+		{
+			name: "provider pending",
+			lookupResult: ProviderResult{
+				Outcome: ProviderPending,
+			},
+		},
+		{
+			name:      "provider unavailable",
+			lookupErr: errors.New("provider temporarily unavailable"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newServiceFixture(t)
+
+			request := f.request(
+				"charge-payment",
+				"payment-uncertain-"+tt.name,
+				"payment-provider",
+				[]byte(`{"amount":1000}`),
+			)
+
+			operation, created, err := database.ReserveExecutionOperation(
+				f.ctx,
+				f.pool,
+				f.databaseInput(request),
+			)
+			if err != nil {
+				t.Fatalf("reserve operation: %v", err)
+			}
+
+			if !created {
+				t.Fatal("expected initial reservation")
+			}
+
+			if err := database.MarkExecutionOutcomeUnknown(
+				f.ctx,
+				f.pool,
+				operation.ID,
+				f.fencingToken,
+				"original provider request timed out",
+			); err != nil {
+				t.Fatalf("mark operation unknown: %v", err)
+			}
+
+			provider := &mockProvider{
+				lookupResult: tt.lookupResult,
+				lookupErr:    tt.lookupErr,
+			}
+
+			service, err := NewOperationService(
+				f.pool,
+				map[string]Provider{
+					"payment-provider": provider,
+				},
+			)
+			if err != nil {
+				t.Fatalf("create operation service: %v", err)
+			}
+
+			_, err = service.Execute(f.ctx, request)
+
+			if !errors.Is(err, ErrOperationOutcomeUnknown) {
+				t.Fatalf(
+					"expected unknown outcome error, got %v",
+					err,
+				)
+			}
+
+			executeCalls, lookupCalls := provider.calls()
+
+			if executeCalls != 0 {
+				t.Fatalf(
+					"provider must not execute again, got %d calls",
+					executeCalls,
+				)
+			}
+
+			if lookupCalls != 1 {
+				t.Fatalf(
+					"expected one provider lookup, got %d",
+					lookupCalls,
+				)
+			}
+
+			saved, err := database.GetExecutionOperation(
+				f.ctx,
+				f.pool,
+				operation.ID,
+			)
+			if err != nil {
+				t.Fatalf("get operation: %v", err)
+			}
+
+			if saved.Status != "outcome_unknown" {
+				t.Fatalf(
+					"expected outcome_unknown, got %s",
+					saved.Status,
+				)
+			}
+		})
 	}
 }

@@ -222,9 +222,19 @@ func (s *OperationService) Execute(ctx context.Context, request OperationRequest
 			providerResult.Data,
 		)
 		if err != nil {
-			return OperationResult{}, fmt.Errorf(
-				"provider reported success but Chronos could not persist the result: %w",
-				err,
+			unknownErr := s.markUnknown(
+				ctx,
+				operation.ID,
+				request.FencingToken,
+				"provider succeeded but result persistence failed",
+			)
+
+			return OperationResult{}, errors.Join(
+				fmt.Errorf(
+					"provider reported success but Chronos could not persist the result: %w",
+					err,
+				),
+				unknownErr,
 			)
 		}
 
