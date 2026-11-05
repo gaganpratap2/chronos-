@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -246,4 +247,50 @@ func (p *RecoveryProcessor) reschedule(
 	}
 
 	return nil
+}
+
+// Run periodically processes eligible external operation recoveries.
+// Individual processing errors are logged; the loop continues so that
+// temporary database or provider problems do not stop future recovery.
+func (p *RecoveryProcessor) Run(
+	ctx context.Context,
+	pollInterval time.Duration,
+) error {
+	if ctx == nil {
+		return errors.New("recovery context is nil")
+	}
+
+	if pollInterval < time.Millisecond {
+		return errors.New("recovery poll interval must be at least 1ms")
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	log.Printf(
+		"Recovery processor %s started with poll interval %s",
+		p.workerID,
+		pollInterval,
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf(
+				"Recovery processor %s stopped",
+				p.workerID,
+			)
+			return nil
+
+		case <-ticker.C:
+			_, err := p.RunOnce(ctx)
+			if err != nil {
+				log.Printf(
+					"Recovery processor %s failed to process an operation: %v",
+					p.workerID,
+					err,
+				)
+			}
+		}
+	}
 }

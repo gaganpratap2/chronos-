@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -613,5 +614,64 @@ func TestRecoveryProcessorStopsAfterMaximumAttempts(t *testing.T) {
 			executeCalls,
 			lookupCalls,
 		)
+	}
+}
+
+func TestRecoveryProcessorRunStopsOnContextCancellation(t *testing.T) {
+	f := newServiceFixture(t)
+
+	processor, err := NewRecoveryProcessor(
+		f.pool,
+		map[string]Provider{
+			"payment-provider": &mockProvider{},
+		},
+		"recovery-worker-shutdown",
+		time.Minute,
+		5,
+	)
+	if err != nil {
+		t.Fatalf("create recovery processor: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(f.ctx)
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- processor.Run(ctx, 10*time.Millisecond)
+	}()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected clean shutdown, got: %v", err)
+		}
+
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery processor did not stop after cancellation")
+	}
+}
+
+func TestRecoveryProcessorRunRejectsInvalidPollInterval(t *testing.T) {
+	f := newServiceFixture(t)
+
+	processor, err := NewRecoveryProcessor(
+		f.pool,
+		map[string]Provider{
+			"payment-provider": &mockProvider{},
+		},
+		"recovery-worker-invalid-interval",
+		time.Minute,
+		5,
+	)
+	if err != nil {
+		t.Fatalf("create recovery processor: %v", err)
+	}
+
+	err = processor.Run(f.ctx, 0)
+	if err == nil {
+		t.Fatal("expected an error for zero poll interval")
 	}
 }

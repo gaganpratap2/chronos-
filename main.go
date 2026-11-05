@@ -468,6 +468,30 @@ func main() {
 	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
 	log.Printf("Starting worker with ID: %s", workerID)
 
+	recoveryWorkerID := fmt.Sprintf(
+		"%s-recovery-%d",
+		hostname,
+		os.Getpid(),
+	)
+
+	recoveryProcessor, err := execution.NewRecoveryProcessor(
+		pool,
+		map[string]execution.Provider{
+			appJobProvider: developmentProvider,
+		},
+		recoveryWorkerID,
+		30*time.Second,
+		execution.MaxRecoveryAttempts,
+	)
+	if err != nil {
+		log.Fatalf("create recovery processor: %v", err)
+	}
+
+	log.Printf(
+		"Starting recovery processor with ID: %s",
+		recoveryWorkerID,
+	)
+
 	w := &worker.Worker{
 		WorkerID:          workerID,
 		Pool:              pool,
@@ -486,6 +510,15 @@ func main() {
 	go func() {
 		if err := w.Run(workerCtx); err != nil {
 			log.Printf("Worker stopped: %v", err)
+		}
+	}()
+
+	go func() {
+		if err := recoveryProcessor.Run(
+			workerCtx,
+			5*time.Second,
+		); err != nil {
+			log.Printf("Recovery processor stopped: %v", err)
 		}
 	}()
 
