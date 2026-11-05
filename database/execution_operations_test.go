@@ -931,3 +931,459 @@ func TestReserveExecutionOperationReturnsCompletedResult(t *testing.T) {
 		t.Fatal("original provider reference was not preserved")
 	}
 }
+
+func TestCompleteExecutionOperationRecovery(t *testing.T) {
+	f := newExecutionOperationFixture(t)
+
+	input := f.input(
+		"charge-payment",
+		"recovery-success-test",
+		[]byte(`{"amount":1000,"currency":"INR"}`),
+	)
+
+	operation, created, err := ReserveExecutionOperation(
+		f.ctx,
+		f.pool,
+		input,
+	)
+	if err != nil {
+		t.Fatalf("reserve operation: %v", err)
+	}
+	if !created {
+		t.Fatal("expected operation to be created")
+	}
+
+	if err := MarkExecutionOutcomeUnknown(
+		f.ctx,
+		f.pool,
+		operation.ID,
+		f.fencingToken,
+		"provider response timed out",
+	); err != nil {
+		t.Fatalf("mark operation unknown: %v", err)
+	}
+
+	// Recovery processor only handles operations linked to Failed jobs.
+	_, err = f.pool.Exec(
+		f.ctx,
+		`UPDATE jobs SET status = 'Failed' WHERE id = $1`,
+		f.jobID,
+	)
+	if err != nil {
+		t.Fatalf("mark job failed: %v", err)
+	}
+
+	recovered, claimed, err := ClaimNextExecutionOperationRecovery(
+		f.ctx,
+		f.pool,
+		"recovery-worker-A",
+		time.Minute,
+		5,
+	)
+	if err != nil {
+		t.Fatalf("claim recovery operation: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected recovery operation to be claimed")
+	}
+
+	if recovered.ID != operation.ID {
+		t.Fatalf(
+			"expected operation ID %d, got %d",
+			operation.ID,
+			recovered.ID,
+		)
+	}
+
+	if recovered.RecoveryAttemptCount != 1 {
+		t.Fatalf(
+			"expected recovery attempt count 1, got %d",
+			recovered.RecoveryAttemptCount,
+		)
+	}
+
+	providerReference := "PAY-RECOVERED-001"
+	result := []byte(`{"status":"SUCCESS","amount":1000}`)
+
+	completed, err := CompleteExecutionOperationRecovery(
+		f.ctx,
+		f.pool,
+		recovered.ID,
+		"recovery-worker-A",
+		recovered.RecoveryFencingToken,
+		&providerReference,
+		result,
+	)
+	if err != nil {
+		t.Fatalf("complete recovery: %v", err)
+	}
+
+	if completed.Status != "succeeded" {
+		t.Fatalf("expected succeeded, got %s", completed.Status)
+	}
+
+	if completed.RecoveryWorkerID != nil {
+		t.Fatal("expected recovery worker ownership to be cleared")
+	}
+
+	if completed.RecoveryLeaseUntil != nil {
+		t.Fatal("expected recovery lease to be cleared")
+	}
+
+	if completed.NextRecoveryAt != nil {
+		t.Fatal("expected next recovery time to be cleared")
+	}
+
+	// Verify the final state persisted in PostgreSQL.
+	stored, err := GetExecutionOperation(
+		f.ctx,
+		f.pool,
+		operation.ID,
+	)
+	if err != nil {
+		t.Fatalf("get completed operation: %v", err)
+	}
+
+	if stored.Status != "succeeded" {
+		t.Fatalf("expected persisted succeeded status, got %s", stored.Status)
+	}
+}
+
+func TestFailExecutionOperationRecovery(t *testing.T) {
+	f := newExecutionOperationFixture(t)
+
+	input := f.input(
+		"charge-payment",
+		"recovery-failure-test",
+		[]byte(`{"amount":1000,"currency":"INR"}`),
+	)
+
+	operation, created, err := ReserveExecutionOperation(
+		f.ctx, f.pool, input,
+	)
+	if err != nil {
+		t.Fatalf("reserve operation: %v", err)
+	}
+	if !created {
+		t.Fatal("expected operation to be created")
+	}
+
+	if err := MarkExecutionOutcomeUnknown(
+		f.ctx, f.pool, operation.ID,
+		f.fencingToken, "provider timed out",
+	); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+
+	_, err = f.pool.Exec(
+		f.ctx,
+		`UPDATE jobs SET status = 'Failed' WHERE id = $1`,
+		f.jobID,
+	)
+	if err != nil {
+		t.Fatalf("mark job failed: %v", err)
+	}
+
+	claimedOperation, claimed, err := ClaimNextExecutionOperationRecovery(
+		f.ctx, f.pool, "recovery-worker-A", time.Minute, 5,
+	)
+	if err != nil {
+		t.Fatalf("claim recovery: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected recovery claim")
+	}
+
+	failed, err := FailExecutionOperationRecovery(
+		f.ctx,
+		f.pool,
+		claimedOperation.ID,
+		"recovery-worker-A",
+		claimedOperation.RecoveryFencingToken,
+		"provider confirmed payment was declined",
+	)
+	if err != nil {
+		t.Fatalf("fail recovery: %v", err)
+	}
+
+	if failed.Status != "failed" {
+		t.Fatalf("expected failed, got %s", failed.Status)
+	}
+
+	if failed.NextRecoveryAt != nil {
+		t.Fatal("expected recovery schedule to be cleared")
+	}
+	if failed.RecoveryWorkerID != nil {
+		t.Fatal("expected recovery ownership to be cleared")
+	}
+	if failed.RecoveryLeaseUntil != nil {
+		t.Fatal("expected recovery lease to be cleared")
+	}
+
+	stored, err := GetExecutionOperation(f.ctx, f.pool, operation.ID)
+	if err != nil {
+		t.Fatalf("get operation: %v", err)
+	}
+	if stored.Status != "failed" {
+		t.Fatalf("expected persisted failed status, got %s", stored.Status)
+	}
+}
+
+func TestRescheduleExecutionOperationRecovery(t *testing.T) {
+	f := newExecutionOperationFixture(t)
+
+	input := f.input(
+		"charge-payment",
+		"recovery-reschedule-test",
+		[]byte(`{"amount":1000,"currency":"INR"}`),
+	)
+
+	operation, created, err := ReserveExecutionOperation(
+		f.ctx, f.pool, input,
+	)
+	if err != nil {
+		t.Fatalf("reserve operation: %v", err)
+	}
+	if !created {
+		t.Fatal("expected operation to be created")
+	}
+
+	if err := MarkExecutionOutcomeUnknown(
+		f.ctx, f.pool, operation.ID,
+		f.fencingToken, "provider timed out",
+	); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+
+	_, err = f.pool.Exec(
+		f.ctx,
+		`UPDATE jobs SET status = 'Failed' WHERE id = $1`,
+		f.jobID,
+	)
+	if err != nil {
+		t.Fatalf("mark job failed: %v", err)
+	}
+
+	// First recovery attempt.
+	claimedOperation, claimed, err := ClaimNextExecutionOperationRecovery(
+		f.ctx, f.pool, "recovery-worker-A", time.Minute, 2,
+	)
+	if err != nil {
+		t.Fatalf("claim first recovery: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected first recovery claim")
+	}
+
+	firstDelay := 30 * time.Second
+
+	rescheduled, err := RescheduleExecutionOperationRecovery(
+		f.ctx,
+		f.pool,
+		claimedOperation.ID,
+		"recovery-worker-A",
+		claimedOperation.RecoveryFencingToken,
+		"provider still cannot confirm outcome",
+		firstDelay,
+		2,
+	)
+	if err != nil {
+		t.Fatalf("reschedule first recovery: %v", err)
+	}
+
+	if rescheduled.Status != "outcome_unknown" {
+		t.Fatalf("expected outcome_unknown, got %s", rescheduled.Status)
+	}
+	if rescheduled.NextRecoveryAt == nil {
+		t.Fatal("expected another recovery attempt to be scheduled")
+	}
+	if rescheduled.RecoveryWorkerID != nil {
+		t.Fatal("expected recovery ownership to be cleared")
+	}
+
+	// Make the next attempt due immediately for deterministic testing.
+	_, err = f.pool.Exec(
+		f.ctx,
+		`UPDATE execution_operations
+         SET next_recovery_at = NOW()
+         WHERE id = $1`,
+		operation.ID,
+	)
+	if err != nil {
+		t.Fatalf("make recovery due: %v", err)
+	}
+
+	// Second and final recovery attempt.
+	finalClaim, claimed, err := ClaimNextExecutionOperationRecovery(
+		f.ctx, f.pool, "recovery-worker-B", time.Minute, 2,
+	)
+	if err != nil {
+		t.Fatalf("claim final recovery: %v", err)
+	}
+	if !claimed {
+		t.Fatal("expected final recovery claim")
+	}
+
+	if finalClaim.RecoveryAttemptCount != 2 {
+		t.Fatalf(
+			"expected 2 recovery attempts, got %d",
+			finalClaim.RecoveryAttemptCount,
+		)
+	}
+
+	exhausted, err := RescheduleExecutionOperationRecovery(
+		f.ctx,
+		f.pool,
+		finalClaim.ID,
+		"recovery-worker-B",
+		finalClaim.RecoveryFencingToken,
+		"provider still cannot confirm outcome",
+		60*time.Second,
+		2,
+	)
+	if err != nil {
+		t.Fatalf("reschedule final recovery: %v", err)
+	}
+
+	if exhausted.Status != "outcome_unknown" {
+		t.Fatalf("expected outcome_unknown, got %s", exhausted.Status)
+	}
+	if exhausted.NextRecoveryAt != nil {
+		t.Fatal("expected automatic recovery to stop at attempt limit")
+	}
+	if exhausted.RecoveryWorkerID != nil {
+		t.Fatal("expected recovery worker ownership to be cleared")
+	}
+
+	// The exhausted operation must not be claimable again.
+	_, claimed, err = ClaimNextExecutionOperationRecovery(
+		f.ctx, f.pool, "recovery-worker-C", time.Minute, 2,
+	)
+	if err != nil {
+		t.Fatalf("check exhausted operation: %v", err)
+	}
+	if claimed {
+		t.Fatal("exhausted operation must not be claimed again")
+	}
+}
+
+func TestConcurrentExecutionRecoveryClaims(t *testing.T) {
+	f := newExecutionOperationFixture(t)
+
+	input := f.input(
+		"charge-payment",
+		"recovery-concurrent-claim-test",
+		[]byte(`{"amount":1000,"currency":"INR"}`),
+	)
+
+	operation, created, err := ReserveExecutionOperation(
+		f.ctx, f.pool, input,
+	)
+	if err != nil {
+		t.Fatalf("reserve operation: %v", err)
+	}
+	if !created {
+		t.Fatal("expected operation to be created")
+	}
+
+	if err := MarkExecutionOutcomeUnknown(
+		f.ctx, f.pool, operation.ID,
+		f.fencingToken, "provider timed out",
+	); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+
+	_, err = f.pool.Exec(
+		f.ctx,
+		`UPDATE jobs SET status = 'Failed' WHERE id = $1`,
+		f.jobID,
+	)
+	if err != nil {
+		t.Fatalf("mark job failed: %v", err)
+	}
+
+	type claimResult struct {
+		workerID string
+		claimed  bool
+		err      error
+	}
+
+	start := make(chan struct{})
+	results := make(chan claimResult, 2)
+
+	var wg sync.WaitGroup
+
+	workers := []string{
+		"recovery-worker-A",
+		"recovery-worker-B",
+	}
+
+	for _, workerID := range workers {
+		wg.Add(1)
+
+		go func(id string) {
+			defer wg.Done()
+
+			<-start
+
+			_, claimed, err := ClaimNextExecutionOperationRecovery(
+				f.ctx,
+				f.pool,
+				id,
+				time.Minute,
+				5,
+			)
+
+			results <- claimResult{
+				workerID: id,
+				claimed:  claimed,
+				err:      err,
+			}
+		}(workerID)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successfulClaims := 0
+
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf(
+				"%s claim failed: %v",
+				result.workerID,
+				result.err,
+			)
+		}
+
+		if result.claimed {
+			successfulClaims++
+		}
+	}
+
+	if successfulClaims != 1 {
+		t.Fatalf(
+			"expected exactly one successful claim, got %d",
+			successfulClaims,
+		)
+	}
+
+	stored, err := GetExecutionOperation(
+		f.ctx, f.pool, operation.ID,
+	)
+	if err != nil {
+		t.Fatalf("get operation: %v", err)
+	}
+
+	if stored.RecoveryWorkerID == nil {
+		t.Fatal("expected an assigned recovery worker")
+	}
+
+	if stored.RecoveryAttemptCount != 1 {
+		t.Fatalf(
+			"expected exactly one recovery attempt, got %d",
+			stored.RecoveryAttemptCount,
+		)
+	}
+}

@@ -38,21 +38,26 @@ var (
 // ExecutionOperation represents one logical external side effect
 // performed by a workflow task.
 type ExecutionOperation struct {
-	ID                int64
-	WorkflowTaskID    int64
-	OperationName     string
-	Provider          string
-	IdempotencyKey    string
-	RequestHash       []byte
-	Status            string
-	FencingToken      int64
-	ProviderReference *string
-	Result            []byte
-	LastError         *string
-	AttemptCount      int
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
-	CompletedAt       *time.Time
+	ID                   int64
+	WorkflowTaskID       int64
+	OperationName        string
+	Provider             string
+	IdempotencyKey       string
+	RequestHash          []byte
+	Status               string
+	FencingToken         int64
+	ProviderReference    *string
+	Result               []byte
+	LastError            *string
+	AttemptCount         int
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	CompletedAt          *time.Time
+	RecoveryAttemptCount int
+	NextRecoveryAt       *time.Time
+	RecoveryWorkerID     *string
+	RecoveryLeaseUntil   *time.Time
+	RecoveryFencingToken int64
 }
 
 // ExecutionOperationInput contains the information required
@@ -81,16 +86,24 @@ const executionOperationColumns = `
 	attempt_count,
 	created_at,
 	updated_at,
-	completed_at
+	completed_at,
+	recovery_attempt_count,
+	next_recovery_at,
+	recovery_worker_id,
+	recovery_lease_until,
+	recovery_fencing_token
 `
 
 // scanExecutionOperation converts a PostgreSQL row into an ExecutionOperation.
 func scanExecutionOperation(row pgx.Row) (ExecutionOperation, error) {
-
 	var operation ExecutionOperation
+
 	var providerReference sql.NullString
 	var lastError sql.NullString
 	var completedAt sql.NullTime
+	var nextRecoveryAt sql.NullTime
+	var recoveryWorkerID sql.NullString
+	var recoveryLeaseUntil sql.NullTime
 
 	err := row.Scan(
 		&operation.ID,
@@ -108,6 +121,11 @@ func scanExecutionOperation(row pgx.Row) (ExecutionOperation, error) {
 		&operation.CreatedAt,
 		&operation.UpdatedAt,
 		&completedAt,
+		&operation.RecoveryAttemptCount,
+		&nextRecoveryAt,
+		&recoveryWorkerID,
+		&recoveryLeaseUntil,
+		&operation.RecoveryFencingToken,
 	)
 
 	if err != nil {
@@ -129,8 +147,22 @@ func scanExecutionOperation(row pgx.Row) (ExecutionOperation, error) {
 		operation.CompletedAt = &value
 	}
 
-	return operation, nil
+	if nextRecoveryAt.Valid {
+		value := nextRecoveryAt.Time
+		operation.NextRecoveryAt = &value
+	}
 
+	if recoveryWorkerID.Valid {
+		value := recoveryWorkerID.String
+		operation.RecoveryWorkerID = &value
+	}
+
+	if recoveryLeaseUntil.Valid {
+		value := recoveryLeaseUntil.Time
+		operation.RecoveryLeaseUntil = &value
+	}
+
+	return operation, nil
 }
 
 // validateExecutionOperationInput validates the reservation parameters.
@@ -464,20 +496,24 @@ func MarkExecutionOutcomeUnknown(
 	// should not create another execution attempt.
 	if operation.Status == "outcome_unknown" &&
 		operation.LastError != nil &&
-		*operation.LastError == lastError {
+		*operation.LastError == lastError &&
+		operation.NextRecoveryAt != nil {
 		return nil
 	}
 
 	tag, err := tx.Exec(
 		ctx,
 		`UPDATE execution_operations
-		 SET status = 'outcome_unknown',
-		     last_error = $3,
-		     completed_at = NULL,
-		     updated_at = NOW()
-		 WHERE id = $1
-		   AND fencing_token = $2
-		   AND status IN ('processing', 'outcome_unknown')`,
+SET status = 'outcome_unknown',
+    last_error = $3,
+    completed_at = NULL,
+    next_recovery_at = COALESCE(next_recovery_at, NOW()),
+    recovery_worker_id = NULL,
+    recovery_lease_until = NULL,
+    updated_at = NOW()
+WHERE id = $1
+  AND fencing_token = $2
+  AND status IN ('processing', 'outcome_unknown')`,
 		operationID,
 		fencingToken,
 		lastError,
