@@ -2,6 +2,9 @@ package scheduler
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
 	"time"
 
 	"chronos/database"
@@ -10,50 +13,149 @@ import (
 )
 
 type Scheduler struct {
-	Pool         *pgxpool.Pool
-	PollInterval time.Duration
-	RunOnceFunc  func(context.Context) error
+	Pool              *pgxpool.Pool
+	PollInterval      time.Duration
+	RunOnceFunc       func(context.Context) error
+	InstanceID        string
+	Hostname          string
+	LeaseDuration     time.Duration
+	HeartbeatInterval time.Duration
 }
 
 func New(pool *pgxpool.Pool) *Scheduler {
+	hostname, _ := os.Hostname()
+
 	return &Scheduler{
-		Pool:         pool,
-		PollInterval: 500 * time.Millisecond,
+		Pool:              pool,
+		PollInterval:      500 * time.Millisecond,
+		InstanceID:        fmt.Sprintf("%s-%d", hostname, time.Now().UnixNano()),
+		Hostname:          hostname,
+		LeaseDuration:     30 * time.Second,
+		HeartbeatInterval: 10 * time.Second,
 	}
 }
 
 func (s *Scheduler) Run(ctx context.Context) error {
-	interval := s.PollInterval
-	if interval <= 0 {
-		interval = 500 * time.Millisecond
+	// Respect cancellation before doing any database work.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	if s == nil {
+		return errors.New("scheduler is nil")
+	}
+
+	// RunOnceFunc is an injected execution hook used by tests.
+	// Real scheduler instances use the PostgreSQL instance registry.
+	useInstanceRegistry := s.Pool != nil
+	// useInstanceRegistry := s.Pool != nil && s.RunOnceFunc == nil
+
+	pollInterval := s.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+
+	leaseDuration := s.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+
+	heartbeatInterval := s.HeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = leaseDuration / 3
+	}
+
+	if heartbeatInterval <= 0 || heartbeatInterval >= leaseDuration {
+		return errors.New(
+			"scheduler heartbeat interval must be positive and shorter than lease duration",
+		)
+	}
+
+	if useInstanceRegistry {
+		if s.InstanceID == "" || s.Hostname == "" {
+			return errors.New("scheduler instance ID and hostname are required")
+		}
+
+		if err := database.RegisterSchedulerInstance(
+			ctx,
+			s.Pool,
+			s.InstanceID,
+			s.Hostname,
+			leaseDuration,
+		); err != nil {
+			return fmt.Errorf("register scheduler instance: %w", err)
+		}
+
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(
+				context.Background(),
+				5*time.Second,
+			)
+			defer cancel()
+
+			if err := database.StopSchedulerInstance(
+				stopCtx,
+				s.Pool,
+				s.InstanceID,
+			); err != nil {
+				fmt.Printf(
+					"stop scheduler instance: %v\n",
+					err,
+				)
+			}
+		}()
+	}
+
+	pollTicker := time.NewTicker(pollInterval)
+	defer pollTicker.Stop()
+
+	heartbeatTicker := time.NewTicker(heartbeatInterval)
+	defer heartbeatTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case <-ticker.C:
+		case <-heartbeatTicker.C:
+			if !useInstanceRegistry {
+				continue
+			}
+
+			if err := database.RenewSchedulerInstanceLease(
+				ctx,
+				s.Pool,
+				s.InstanceID,
+				leaseDuration,
+			); err != nil {
+				return fmt.Errorf(
+					"renew scheduler lease: %w",
+					err,
+				)
+			}
+
+		case <-pollTicker.C:
 			runOnce := s.RunOnce
+
 			if s.RunOnceFunc != nil {
 				runOnce = s.RunOnceFunc
+			} else if s.Pool == nil {
+				// No database pool: wait for cancellation in test mode.
+				continue
 			}
 
 			if err := runOnce(ctx); err != nil {
-				return err
+				return fmt.Errorf("scheduler dispatch: %w", err)
 			}
 		}
 	}
 }
 
 func (s *Scheduler) RunOnce(ctx context.Context) error {
-	_, err := database.ClaimTaskAndCreateJob(
-		ctx,
-		s.Pool,
-	)
+	if s.Pool == nil {
+		return errors.New("scheduler database pool is nil")
+	}
 
+	_, err := database.ClaimTaskAndCreateJob(ctx, s.Pool)
 	return err
 }
