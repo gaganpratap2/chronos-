@@ -53,6 +53,80 @@ func ClaimTaskAndCreateJob(
 	return task, nil
 }
 
+func ClaimTaskAndCreateJobAsLeader(ctx context.Context, pool *pgxpool.Pool, instanceID string, fencingToken int64) (*DispatchedTask, error) {
+
+	if pool == nil {
+		return nil, errors.New("database pool is nil")
+	}
+
+	if instanceID == "" {
+		return nil, errors.New("scheduler instance ID is empty")
+	}
+
+	if fencingToken <= 0 {
+		return nil, errors.New("scheduler fencing token must be positive")
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"begin leader task dispatch transaction: %w",
+			err,
+		)
+	}
+
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var valid int
+
+	err = tx.QueryRow(ctx,
+		`SELECT 1
+		FROM scheduler_leadership leadership
+		WHERE leadership.singleton_id = 1
+		  AND leadership.instance_id = $1
+		  AND leadership.fencing_token = $2
+		  AND leadership.lease_until > clock_timestamp()
+		  AND EXISTS (
+			SELECT 1
+			FROM scheduler_instances instance
+			WHERE instance.id = leadership.instance_id
+			  AND instance.status = 'running'
+			  AND instance.lease_until > clock_timestamp()
+		  )
+		FOR UPDATE OF leadership
+		`, instanceID,
+		fencingToken,
+	).Scan(&valid)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrSchedulerLeaseLost
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf(
+			"verify scheduler leadership before dispatch: %w",
+			err,
+		)
+	}
+
+	// Reuse the existing dispatch implementation.
+	task, err := claimTaskAndCreateJobTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf(
+			"commit leader task dispatch: %w",
+			err,
+		)
+	}
+
+	return task, nil
+}
+
 func claimTaskAndCreateJobTx(
 	ctx context.Context,
 	tx pgx.Tx,
