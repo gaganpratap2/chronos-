@@ -18,7 +18,14 @@ type DispatchedTask struct {
 	TaskName   string
 }
 
-func ClaimTaskAndCreateJob(ctx context.Context, pool *pgxpool.Pool) (*DispatchedTask, error) {
+func ClaimTaskAndCreateJob(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+) (*DispatchedTask, error) {
+	if pool == nil {
+		return nil, errors.New("database pool is nil")
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -31,9 +38,28 @@ func ClaimTaskAndCreateJob(ctx context.Context, pool *pgxpool.Pool) (*Dispatched
 		_ = tx.Rollback(ctx)
 	}()
 
+	task, err := claimTaskAndCreateJobTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf(
+			"commit task dispatch: %w",
+			err,
+		)
+	}
+
+	return task, nil
+}
+
+func claimTaskAndCreateJobTx(
+	ctx context.Context,
+	tx pgx.Tx,
+) (*DispatchedTask, error) {
 	var task DispatchedTask
 
-	err = tx.QueryRow(
+	err := tx.QueryRow(
 		ctx,
 		`SELECT
 			t.id,
@@ -42,12 +68,12 @@ func ClaimTaskAndCreateJob(ctx context.Context, pool *pgxpool.Pool) (*Dispatched
 		FROM workflow_tasks t
 		WHERE t.status = 'Pending'
 		  AND NOT EXISTS (
-			  SELECT 1
-			  FROM task_dependencies d
-			  JOIN workflow_tasks dependency
-			    ON dependency.id = d.depends_on_task_id
-			  WHERE d.task_id = t.id
-			    AND dependency.status <> 'Completed'
+			SELECT 1
+			FROM task_dependencies d
+			JOIN workflow_tasks dependency
+			  ON dependency.id = d.depends_on_task_id
+			WHERE d.task_id = t.id
+			  AND dependency.status <> 'Completed'
 		  )
 		ORDER BY t.id
 		LIMIT 1
@@ -75,12 +101,10 @@ func ClaimTaskAndCreateJob(ctx context.Context, pool *pgxpool.Pool) (*Dispatched
 		return nil, err
 	}
 
-	// Build the normal V2 job.
 	executionJob, err := job.NewJob(
 		jobID,
 		task.TaskName,
 	)
-
 	if err != nil {
 		return nil, fmt.Errorf(
 			"create execution job: %w",
@@ -88,7 +112,6 @@ func ClaimTaskAndCreateJob(ctx context.Context, pool *pgxpool.Pool) (*Dispatched
 		)
 	}
 
-	// Persist the V2 execution job.
 	_, err = tx.Exec(
 		ctx,
 		`
@@ -117,8 +140,6 @@ func ClaimTaskAndCreateJob(ctx context.Context, pool *pgxpool.Pool) (*Dispatched
 		)
 	}
 
-	// Attach the execution job to the workflow task
-	// and move the task to Ready.
 	tag, err := tx.Exec(
 		ctx,
 		`
@@ -145,13 +166,6 @@ func ClaimTaskAndCreateJob(ctx context.Context, pool *pgxpool.Pool) (*Dispatched
 		return nil, fmt.Errorf(
 			"task %d was not updated",
 			task.TaskID,
-		)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf(
-			"commit task dispatch: %w",
-			err,
 		)
 	}
 
