@@ -8,6 +8,14 @@ import (
 var ErrInvalidHardState = errors.New("invalid raft hard state")
 var ErrInvalidStorage = errors.New("raft storage cannot be nil")
 
+func validateHardState(state HardState) error {
+	if state.CurrentTerm == 0 && state.VotedFor != "" {
+		return ErrInvalidHardState
+	}
+
+	return nil
+}
+
 // HardState contains Raft information that must survive restarts.
 type HardState struct {
 	CurrentTerm uint64
@@ -41,9 +49,22 @@ func (s *MemoryStorage) LoadHardState() (HardState, error) {
 }
 
 // SaveHardState saves the Raft state.
+// func (s *MemoryStorage) SaveHardState(state HardState) error {
+// 	s.mu.Lock()
+// 	defer s.mu.Unlock()
+
+// 	s.state = state
+
+// 	return nil
+// }
+
 func (s *MemoryStorage) SaveHardState(state HardState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if err := validateHardState(state); err != nil {
+		return err
+	}
 
 	s.state = state
 

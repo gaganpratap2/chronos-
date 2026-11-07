@@ -71,7 +71,12 @@ func TestObserveHigherTermDoesNotChangeStateWhenStorageFails(t *testing.T) {
 		failSave: true,
 	}
 
-	node, err := NewNodeWithStorage("node-A", nil, storage)
+	node, err := NewNodeWithStorage(
+		"node-A",
+		[]string{"node-B", "node-C"},
+		storage,
+	)
+
 	if err != nil {
 		t.Fatal(err)
 	}

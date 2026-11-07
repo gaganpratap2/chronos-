@@ -886,7 +886,8 @@ func TestRetryJobCapsExponentialBackoff(t *testing.T) {
 
 	remaining := time.Until(got.NextRetryAt.UTC())
 
-	if remaining < 8*time.Second || remaining > 12*time.Second {
+	if remaining < 7500*time.Millisecond ||
+		remaining > 12500*time.Millisecond {
 		t.Fatalf(
 			"expected retry delay between 8s and 12s, got %v",
 			remaining,

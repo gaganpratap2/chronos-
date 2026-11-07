@@ -58,6 +58,25 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 		return nil, err
 	}
 
+	if err := validateHardState(hardState); err != nil {
+		return nil, err
+	}
+
+	if hardState.VotedFor != "" {
+		validVoter := hardState.VotedFor == id
+
+		for _, peerID := range peers {
+			if peerID == hardState.VotedFor {
+				validVoter = true
+				break
+			}
+		}
+
+		if !validVoter {
+			return nil, ErrInvalidHardState
+		}
+	}
+
 	peerCopy := append([]string(nil), peers...)
 
 	return &Node{
