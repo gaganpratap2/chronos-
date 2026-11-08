@@ -15,12 +15,14 @@ var (
 type Node struct {
 	mu sync.RWMutex
 
-	id          string
-	state       State
-	currentTerm uint64
-	votedFor    string
-	peers       []string
-	storage     Storage
+	id           string
+	state        State
+	currentTerm  uint64
+	votedFor     string
+	peers        []string
+	storage      Storage
+	lastLogIndex uint64
+	lastLogTerm  uint64
 }
 
 // NewNode creates a new Raft node.
