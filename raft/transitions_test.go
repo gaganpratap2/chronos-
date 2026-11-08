@@ -57,7 +57,7 @@ func TestBecomeLeader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := node.BecomeLeader(); err != nil {
+	if err := node.becomeLeaderIfMajority(1, 2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,12 +67,12 @@ func TestBecomeLeader(t *testing.T) {
 }
 
 func TestBecomeLeaderRejectsFollower(t *testing.T) {
-	node, err := NewNode("node-A", nil)
+	node, err := NewNode("node-A", []string{"node-B", "node-C"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = node.BecomeLeader()
+	err = node.becomeLeaderIfMajority(0, 3)
 
 	if !errors.Is(err, ErrNotCandidate) {
 		t.Errorf("error = %v, want ErrNotCandidate", err)
@@ -89,7 +89,7 @@ func TestObserveHigherTerm(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := node.BecomeLeader(); err != nil {
+	if err := node.becomeLeaderIfMajority(1, 2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -124,5 +124,46 @@ func TestObserveHigherTermRejectsOldTerm(t *testing.T) {
 
 	if !errors.Is(err, ErrTermNotHigher) {
 		t.Errorf("error = %v, want ErrTermNotHigher", err)
+	}
+}
+
+func TestBecomeLeaderWithMajority(t *testing.T) {
+	node, err := NewNode("node-A", []string{"node-B", "node-C"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := node.StartElection(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = node.becomeLeaderIfMajority(1, 2)
+	if err != nil {
+		t.Fatalf("expected successful leadership, got %v", err)
+	}
+
+	if node.State() != StateLeader {
+		t.Errorf("State() = %v, want leader", node.State())
+	}
+}
+
+func TestBecomeLeaderRejectsInsufficientVotes(t *testing.T) {
+	node, err := NewNode("node-A", []string{"node-B", "node-C"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := node.StartElection(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = node.becomeLeaderIfMajority(1, 1)
+
+	if !errors.Is(err, ErrInsufficientVotes) {
+		t.Fatalf("error = %v, want ErrInsufficientVotes", err)
+	}
+
+	if node.State() != StateCandidate {
+		t.Errorf("State() = %v, want candidate", node.State())
 	}
 }

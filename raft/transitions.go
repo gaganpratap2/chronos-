@@ -6,11 +6,13 @@ import (
 )
 
 var (
-	ErrAlreadyLeader = errors.New("raft node is already leader")
-	ErrNotCandidate  = errors.New("raft node is not a candidate")
-	ErrInvalidTerm   = errors.New("raft term must be greater than zero")
-	ErrTermExhausted = errors.New("raft term has reached its maximum value")
-	ErrTermNotHigher = errors.New("received term is not higher")
+	ErrAlreadyLeader       = errors.New("raft node is already leader")
+	ErrNotCandidate        = errors.New("raft node is not a candidate")
+	ErrInvalidTerm         = errors.New("raft term must be greater than zero")
+	ErrTermExhausted       = errors.New("raft term has reached its maximum value")
+	ErrTermNotHigher       = errors.New("received term is not higher")
+	ErrInsufficientVotes   = errors.New("candidate did not receive a majority")
+	ErrElectionTermChanged = errors.New("election term has changed")
 )
 
 // start election
@@ -56,12 +58,22 @@ func (n *Node) StartElection() error {
 
 }
 
-func (n *Node) BecomeLeader() error {
+func (n *Node) becomeLeaderIfMajority(electionTerm uint64, votes int) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	if n.state != StateCandidate {
 		return ErrNotCandidate
+	}
+
+	if n.currentTerm != electionTerm {
+		return ErrElectionTermChanged
+	}
+
+	majority := (len(n.peers)+1)/2 + 1
+
+	if votes < majority {
+		return ErrInsufficientVotes
 	}
 
 	n.state = StateLeader
