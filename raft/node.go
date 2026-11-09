@@ -15,21 +15,24 @@ var (
 type Node struct {
 	mu sync.RWMutex
 
-	id           string
-	state        State
-	currentTerm  uint64
-	votedFor     string
-	peers        []string
-	storage      Storage
-	lastLogIndex uint64
-	lastLogTerm  uint64
-	log          []LogEntry
-	commitIndex  uint64
-	nextIndex    map[string]uint64
-	matchIndex   map[string]uint64
-	applyMu      sync.Mutex
-	lastApplied  uint64
-	stateMachine StateMachine
+	id            string
+	state         State
+	currentTerm   uint64
+	votedFor      string
+	peers         []string
+	storage       Storage
+	lastLogIndex  uint64
+	lastLogTerm   uint64
+	log           []LogEntry
+	commitIndex   uint64
+	nextIndex     map[string]uint64
+	matchIndex    map[string]uint64
+	applyMu       sync.Mutex
+	lastApplied   uint64
+	stateMachine  StateMachine
+	snapshot      Snapshot
+	snapshotIndex uint64
+	snapshotTerm  uint64
 }
 
 // NewNode creates a new Raft node.
@@ -88,14 +91,39 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 
 	peerCopy := append([]string(nil), peers...)
 
-	return &Node{
+	node := &Node{
 		id:          id,
 		state:       StateFollower,
 		currentTerm: hardState.CurrentTerm,
 		votedFor:    hardState.VotedFor,
 		peers:       peerCopy,
 		storage:     storage,
-	}, nil
+	}
+
+	// Load snapshot metadata when the storage supports snapshots.
+	if snapshotStorage, ok := storage.(SnapshotStorage); ok {
+		snapshot, err := snapshotStorage.LoadSnapshot()
+		if err != nil {
+			return nil, err
+		}
+
+		if err := validateSnapshot(snapshot); err != nil {
+			return nil, err
+		}
+
+		node.snapshot = cloneSnapshot(snapshot)
+		node.snapshotIndex = snapshot.LastIncludedIndex
+		node.snapshotTerm = snapshot.LastIncludedTerm
+
+		// A persisted snapshot represents successfully applied entries.
+		node.lastApplied = snapshot.LastIncludedIndex
+		node.commitIndex = snapshot.LastIncludedIndex
+
+		node.lastLogIndex = snapshot.LastIncludedIndex
+		node.lastLogTerm = snapshot.LastIncludedTerm
+	}
+
+	return node, nil
 }
 
 // ID returns the node's unique ID.

@@ -11,6 +11,7 @@ var (
 	ErrNilAppendEntriesTransport = errors.New("append entries transport cannot be nil")
 	ErrUnknownReplicationPeer    = errors.New("unknown replication peer")
 	ErrInvalidNextIndex          = errors.New("invalid replication next index")
+	ErrSnapshotRequired          = errors.New("follower requires snapshot installation")
 )
 
 // ReplicateToPeer sends the log entries needed by one follower.
@@ -43,11 +44,21 @@ func (n *Node) ReplicateToPeer(
 		return false, ErrUnknownReplicationPeer
 	}
 
-	lastLogIndex := uint64(len(n.log))
+	// lastLogIndex := uint64(len(n.log))
+	lastLogIndex := n.lastLogIndexLocked()
+
+	lastLogIndex = n.lastLogIndexLocked()
 
 	if nextIndex == 0 || nextIndex > lastLogIndex+1 {
 		n.mu.Unlock()
 		return false, ErrInvalidNextIndex
+	}
+
+	// A follower behind the leader's snapshot boundary
+	// cannot catch up using ordinary AppendEntries.
+	if nextIndex <= n.snapshotIndex {
+		n.mu.Unlock()
+		return false, ErrSnapshotRequired
 	}
 
 	leaderTerm := n.currentTerm
@@ -61,10 +72,14 @@ func (n *Node) ReplicateToPeer(
 
 	// Copy entries so the network request does not share mutable
 	// command byte slices with the leader's local log.
-	entries := make([]LogEntry, 0, lastLogIndex-prevLogIndex)
+	entries := make([]LogEntry, 0, lastLogIndex-nextIndex+1)
 
 	for index := nextIndex; index <= lastLogIndex; index++ {
-		entry := n.log[index-1]
+		entry, exists := n.logEntryAt(index)
+		if !exists {
+			n.mu.Unlock()
+			return false, ErrInvalidNextIndex
+		}
 
 		entries = append(entries, LogEntry{
 			Term:    entry.Term,

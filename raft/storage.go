@@ -28,11 +28,17 @@ type Storage interface {
 	SaveHardState(state HardState) error
 }
 
+type SnapshotStorage interface {
+	LoadSnapshot() (Snapshot, error)
+	SaveSnapshot(snapshot Snapshot) error
+}
+
 // MemoryStorage is an in-memory implementation of Storage.
 // It is useful for learning and testing, but does not survive process restarts.
 type MemoryStorage struct {
-	mu    sync.Mutex
-	state HardState
+	mu       sync.Mutex
+	state    HardState
+	snapshot Snapshot
 }
 
 // NewMemoryStorage creates an empty in-memory Raft storage.
@@ -68,5 +74,28 @@ func (s *MemoryStorage) SaveHardState(state HardState) error {
 
 	s.state = state
 
+	return nil
+}
+
+// returns an independent copy of the saved snapshot.
+func (s *MemoryStorage) LoadSnapshot() (Snapshot, error) {
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return cloneSnapshot(s.snapshot), nil
+}
+
+// validates and saves an independent copy of the snapshot.
+
+func (s *MemoryStorage) SaveSnapshot(snapshot Snapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := validateSnapshot(snapshot); err != nil {
+		return err
+	}
+
+	s.snapshot = cloneSnapshot(snapshot)
 	return nil
 }

@@ -3,8 +3,6 @@ package raft
 import "bytes"
 
 // AppendEntries handles log replication and leader heartbeats.
-
-// AppendEntries handles log replication and leader heartbeats.
 // Committed entries are applied after releasing the Raft mutex.
 func (n *Node) AppendEntries(
 	req AppendEntriesRequest,
@@ -31,9 +29,6 @@ func (n *Node) AppendEntries(
 func (n *Node) appendEntriesLocked(
 	req AppendEntriesRequest,
 ) (AppendEntriesResponse, error) {
-	// n.mu.Lock()
-	// defer n.mu.Unlock()
-
 	response := AppendEntriesResponse{
 		Term:    n.currentTerm,
 		Success: false,
@@ -64,7 +59,6 @@ func (n *Node) appendEntriesLocked(
 	}
 
 	n.state = StateFollower
-
 	response.Term = n.currentTerm
 
 	// Verify the previous log position.
@@ -84,11 +78,14 @@ func (n *Node) appendEntriesLocked(
 	for i, incoming := range req.Entries {
 		index := req.PrevLogIndex + uint64(i) + 1
 
-		if index > uint64(len(n.log)) {
+		if index > n.lastLogIndexLocked() {
 			break
 		}
 
-		existing := n.log[index-1]
+		existing, exists := n.logEntryAt(index)
+		if !exists {
+			return response, nil
+		}
 
 		if existing.Term != incoming.Term {
 			// Never overwrite an entry already committed.
@@ -96,7 +93,9 @@ func (n *Node) appendEntriesLocked(
 				return response, nil
 			}
 
-			n.log = n.log[:index-1]
+			// Convert the absolute index into a slice offset.
+			offset := index - n.snapshotIndex - 1
+			n.log = n.log[:offset]
 			break
 		}
 	}
@@ -105,7 +104,7 @@ func (n *Node) appendEntriesLocked(
 	for i, incoming := range req.Entries {
 		index := req.PrevLogIndex + uint64(i) + 1
 
-		if index > uint64(len(n.log)) {
+		if index > n.lastLogIndexLocked() {
 			n.log = append(n.log, LogEntry{
 				Term:    incoming.Term,
 				Command: bytes.Clone(incoming.Command),
@@ -113,9 +112,9 @@ func (n *Node) appendEntriesLocked(
 		}
 	}
 
-	// Keep existing log metadata synchronized.
-	n.lastLogIndex = uint64(len(n.log))
-	n.lastLogTerm = 0
+	// Synchronize absolute log metadata.
+	n.lastLogIndex = n.lastLogIndexLocked()
+	n.lastLogTerm = n.snapshotTerm
 
 	if len(n.log) > 0 {
 		n.lastLogTerm = n.log[len(n.log)-1].Term
@@ -125,8 +124,8 @@ func (n *Node) appendEntriesLocked(
 	if req.LeaderCommit > n.commitIndex {
 		newCommitIndex := req.LeaderCommit
 
-		if newCommitIndex > uint64(len(n.log)) {
-			newCommitIndex = uint64(len(n.log))
+		if newCommitIndex > n.lastLogIndex {
+			newCommitIndex = n.lastLogIndex
 		}
 
 		n.commitIndex = newCommitIndex

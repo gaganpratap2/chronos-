@@ -1,7 +1,7 @@
 package raft
 
 func (n *Node) initializeReplicationProgressLocked() {
-	lastLogIndex := uint64(len(n.log))
+	lastLogIndex := n.lastLogIndexLocked()
 
 	n.nextIndex = make(map[string]uint64, len(n.peers))
 	n.matchIndex = make(map[string]uint64, len(n.peers)+1)
@@ -28,13 +28,12 @@ func (n *Node) recordReplicationSuccessLocked(
 		return false
 	}
 
-	// nextIndex, knownPeer := n.nextIndex[peerID]
 	_, knownPeer := n.nextIndex[peerID]
 	if !knownPeer {
 		return false
 	}
 
-	if replicatedIndex > uint64(len(n.log)) {
+	if replicatedIndex > n.lastLogIndexLocked() {
 		return false
 	}
 
@@ -44,7 +43,7 @@ func (n *Node) recordReplicationSuccessLocked(
 	}
 
 	n.nextIndex[peerID] = n.matchIndex[peerID] + 1
-	// _, knownPeer = n.nextIndex[peerID]
+
 	return true
 }
 
@@ -88,7 +87,7 @@ func (n *Node) advanceCommitIndexLocked() bool {
 		return false
 	}
 
-	lastLogIndex := uint64(len(n.log))
+	lastLogIndex := n.lastLogIndexLocked()
 	majority := (len(n.peers)+1)/2 + 1
 
 	// Search backwards to find the highest index that can be committed.

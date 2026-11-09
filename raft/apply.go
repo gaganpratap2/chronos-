@@ -44,12 +44,12 @@ func (n *Node) ApplyCommittedEntries(
 
 		nextIndex := n.lastApplied + 1
 
-		if nextIndex > uint64(len(n.log)) {
+		entry, exists := n.logEntryAt(nextIndex)
+		if !exists {
 			n.mu.RUnlock()
 			return ErrCommittedEntryMissing
 		}
 
-		entry := n.log[nextIndex-1]
 		command := append([]byte(nil), entry.Command...)
 
 		n.mu.RUnlock()
