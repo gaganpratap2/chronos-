@@ -23,6 +23,10 @@ type Node struct {
 	storage      Storage
 	lastLogIndex uint64
 	lastLogTerm  uint64
+	log          []LogEntry
+	commitIndex  uint64
+	nextIndex    map[string]uint64
+	matchIndex   map[string]uint64
 }
 
 // NewNode creates a new Raft node.

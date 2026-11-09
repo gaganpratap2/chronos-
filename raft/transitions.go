@@ -77,6 +77,8 @@ func (n *Node) becomeLeaderIfMajority(electionTerm uint64, votes int) error {
 	}
 
 	n.state = StateLeader
+	n.initializeReplicationProgressLocked()
+
 	return nil
 }
 
