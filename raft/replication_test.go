@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -347,5 +348,53 @@ func TestReplicateToPeerUntilCaughtUp(t *testing.T) {
 				follower.log[i].Command,
 			)
 		}
+	}
+}
+
+func TestLeaderAutomaticallyAppliesCommittedEntries(t *testing.T) {
+	entries := []LogEntry{
+		{Term: 1, Command: []byte("task-1")},
+		{Term: 1, Command: []byte("task-2")},
+	}
+
+	leader, _, transport := newReplicationTestCluster(
+		t,
+		entries,
+		nil,
+	)
+
+	stateMachine := &testStateMachine{}
+
+	if err := leader.SetStateMachine(stateMachine); err != nil {
+		t.Fatal(err)
+	}
+
+	// The follower starts empty, so replication must backtrack
+	// before it can replicate both entries.
+	replicated, err := leader.ReplicateToPeerUntilCaughtUp(
+		context.Background(),
+		transport,
+		"node-B",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !replicated {
+		t.Fatal("expected follower to catch up")
+	}
+
+	expected := []uint64{1, 2}
+
+	if !reflect.DeepEqual(stateMachine.applied, expected) {
+		t.Fatalf(
+			"expected applied indexes %v, got %v",
+			expected,
+			stateMachine.applied,
+		)
+	}
+
+	if leader.LastApplied() != 2 {
+		t.Fatalf("lastApplied = %d, want 2", leader.LastApplied())
 	}
 }

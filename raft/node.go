@@ -27,6 +27,9 @@ type Node struct {
 	commitIndex  uint64
 	nextIndex    map[string]uint64
 	matchIndex   map[string]uint64
+	applyMu      sync.Mutex
+	lastApplied  uint64
+	stateMachine StateMachine
 }
 
 // NewNode creates a new Raft node.

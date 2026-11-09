@@ -3,11 +3,36 @@ package raft
 import "bytes"
 
 // AppendEntries handles log replication and leader heartbeats.
+
+// AppendEntries handles log replication and leader heartbeats.
+// Committed entries are applied after releasing the Raft mutex.
 func (n *Node) AppendEntries(
 	req AppendEntriesRequest,
 ) (AppendEntriesResponse, error) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
+
+	response, err := n.appendEntriesLocked(req)
+
+	n.mu.Unlock()
+
+	if err != nil {
+		return response, err
+	}
+
+	if response.Success {
+		if err := n.applyCommittedEntriesIfConfigured(); err != nil {
+			return response, err
+		}
+	}
+
+	return response, nil
+}
+
+func (n *Node) appendEntriesLocked(
+	req AppendEntriesRequest,
+) (AppendEntriesResponse, error) {
+	// n.mu.Lock()
+	// defer n.mu.Unlock()
 
 	response := AppendEntriesResponse{
 		Term:    n.currentTerm,

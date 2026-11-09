@@ -105,9 +105,9 @@ func (n *Node) ReplicateToPeer(
 	}
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	if n.state != StateLeader || n.currentTerm != leaderTerm {
+		n.mu.Unlock()
 		return false, nil
 	}
 
@@ -118,6 +118,7 @@ func (n *Node) ReplicateToPeer(
 			nextIndex,
 		)
 
+		n.mu.Unlock()
 		return false, nil
 	}
 
@@ -128,10 +129,18 @@ func (n *Node) ReplicateToPeer(
 		leaderTerm,
 		replicatedIndex,
 	) {
+		n.mu.Unlock()
 		return false, nil
 	}
 
 	n.advanceCommitIndexLocked()
+
+	n.mu.Unlock()
+
+	// Apply committed entries only after releasing the Raft mutex.
+	if err := n.applyCommittedEntriesIfConfigured(); err != nil {
+		return true, err
+	}
 
 	return true, nil
 }

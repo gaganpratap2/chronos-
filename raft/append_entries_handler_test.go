@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 )
 
@@ -203,5 +204,47 @@ func TestAppendEntriesRejectsInvalidEntryTerm(t *testing.T) {
 
 	if len(node.log) != 0 {
 		t.Fatal("invalid entry was appended")
+	}
+}
+
+func TestFollowerAutomaticallyAppliesCommittedEntries(t *testing.T) {
+	node := newAppendEntriesTestNode(t)
+
+	stateMachine := &testStateMachine{}
+
+	if err := node.SetStateMachine(stateMachine); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := node.AppendEntries(AppendEntriesRequest{
+		Term:     1,
+		LeaderID: "leader-1",
+		Entries: []LogEntry{
+			{Term: 1, Command: []byte("task-1")},
+			{Term: 1, Command: []byte("task-2")},
+		},
+		LeaderCommit: 2,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !response.Success {
+		t.Fatal("expected AppendEntries to succeed")
+	}
+
+	expected := []uint64{1, 2}
+
+	if !reflect.DeepEqual(stateMachine.applied, expected) {
+		t.Fatalf(
+			"expected applied indexes %v, got %v",
+			expected,
+			stateMachine.applied,
+		)
+	}
+
+	if node.LastApplied() != 2 {
+		t.Fatalf("lastApplied = %d, want 2", node.LastApplied())
 	}
 }
