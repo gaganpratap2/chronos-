@@ -34,6 +34,14 @@ func (n *Node) ApplyCommittedEntries(
 	n.applyMu.Lock()
 	defer n.applyMu.Unlock()
 
+	return n.applyCommittedEntriesLocked(stateMachine)
+}
+
+// applyCommittedEntriesLocked applies committed entries.
+// The caller must hold applyMu.
+func (n *Node) applyCommittedEntriesLocked(
+	stateMachine StateMachine,
+) error {
 	for {
 		n.mu.RLock()
 
@@ -64,4 +72,5 @@ func (n *Node) ApplyCommittedEntries(
 
 		n.lastApplied = nextIndex
 	}
+
 }

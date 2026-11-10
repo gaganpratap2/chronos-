@@ -10,6 +10,11 @@ type Snapshot struct {
 	Data              []byte
 }
 
+type SnapshotStateMachine interface {
+	StateMachine
+	Snapshot() ([]byte, error)
+}
+
 var ErrInvalidSnapshot = errors.New("invalid raft snapshot")
 
 func validateSnapshot(snapshot Snapshot) error {

@@ -8,3 +8,7 @@ package raft
 type StateMachine interface {
 	Apply(index uint64, command []byte) error
 }
+
+type SnapshotRestorer interface {
+	Restore(data []byte) error
+}
