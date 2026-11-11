@@ -1,6 +1,6 @@
 package raft
 
-import "bytes"
+// import "bytes"
 
 // AppendEntries handles log replication and leader heartbeats.
 // Committed entries are applied after releasing the Raft mutex.
@@ -122,10 +122,7 @@ func (n *Node) appendEntriesLocked(
 		candidateLastIndex := n.snapshotIndex + uint64(len(candidate))
 
 		if index > candidateLastIndex {
-			candidate = append(candidate, LogEntry{
-				Term:    incoming.Term,
-				Command: bytes.Clone(incoming.Command),
-			})
+			candidate = append(candidate, cloneLogEntry(incoming))
 		}
 	}
 

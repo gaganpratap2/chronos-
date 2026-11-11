@@ -114,6 +114,9 @@ func TestInstallSnapshotRestoresAndRetainsMatchingSuffix(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("restored-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	}
 
 	response, err := node.InstallSnapshot(req)
@@ -217,6 +220,9 @@ func TestInstallSnapshotDiscardsSuffixWhenBoundaryTermDiffers(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  1,
 		Data:              []byte("new-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	}
 
 	response, err := node.InstallSnapshot(req)
@@ -259,6 +265,9 @@ func TestInstallSnapshotRejectsOutdatedLeader(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("old-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	})
 
 	if err != nil {
@@ -285,6 +294,9 @@ func TestInstallSnapshotRejectsInvalidSnapshot(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  0,
 		Data:              []byte("invalid"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	})
 
 	if !errors.Is(err, ErrInvalidInstallSnapshot) {
@@ -312,6 +324,9 @@ func TestInstallSnapshotPersistenceFailureDoesNotChangeLog(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("new-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	})
 
 	if !errors.Is(err, errInstallSnapshotPersistence) {
@@ -367,6 +382,9 @@ func TestInstallSnapshotRestoreFailureDoesNotChangeSnapshotMetadata(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("new-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	})
 
 	if !errors.Is(err, errInstallSnapshotRestore) {
@@ -403,6 +421,9 @@ func TestInstallSnapshotHardStatePersistenceFailurePreservesTerm(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("new-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	})
 
 	if !errors.Is(err, errInstallHardStatePersistence) {
@@ -438,6 +459,9 @@ func TestInstallSnapshotDoesNotRollbackSnapshotWhenLogRollbackFails(
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("new-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	})
 
 	if err == nil {
@@ -511,5 +535,43 @@ func TestInstallSnapshotDoesNotRollbackSnapshotWhenLogRollbackFails(
 			"expected original 5 in-memory entries, got %d",
 			len(node.log),
 		)
+	}
+}
+
+func TestInstallSnapshotRestoresConfiguration(t *testing.T) {
+	storage := NewMemoryStorage()
+	node, _ := newSnapshotInstallTestNode(t, storage)
+
+	configuration := ConfigurationState{
+		OldVoters: []string{"follower-A", "leader-A", "node-C"},
+	}
+
+	response, err := node.InstallSnapshot(InstallSnapshotRequest{
+		Term:              4,
+		LeaderID:          "leader-A",
+		LastIncludedIndex: 3,
+		LastIncludedTerm:  2,
+		Data:              []byte("restored-state"),
+		Configuration:     configuration,
+	})
+	if err != nil {
+		t.Fatalf("install snapshot: %v", err)
+	}
+
+	if !response.Success {
+		t.Fatal("expected successful snapshot installation")
+	}
+
+	node.mu.RLock()
+	got := node.configuration.Clone()
+	node.mu.RUnlock()
+
+	if !equalVoterSets(got.OldVoters, configuration.OldVoters) {
+		t.Fatalf("configuration = %+v, want %+v", got, configuration)
+	}
+
+	expectedPeers := []string{"leader-A", "node-C"}
+	if !reflect.DeepEqual(node.Peers(), expectedPeers) {
+		t.Fatalf("peers = %v, want %v", node.Peers(), expectedPeers)
 	}
 }

@@ -32,16 +32,9 @@ func (n *Node) RequestVote(
 		return response, nil
 	}
 
-	// Reject candidates that are not cluster members.
-	knownPeer := false
-	for _, peerID := range n.peers {
-		if peerID == req.CandidateID {
-			knownPeer = true
-			break
-		}
-	}
-
-	if !knownPeer {
+	// Reject candidates that are not voters in the active configuration.
+	// During joint consensus, both old and new voters are eligible.
+	if !n.configuration.IsVoter(req.CandidateID) {
 		return response, nil
 	}
 

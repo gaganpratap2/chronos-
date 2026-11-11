@@ -675,3 +675,86 @@ func TestReplicateToAllPeersReplicatesConcurrently(t *testing.T) {
 		follower.mu.RUnlock()
 	}
 }
+
+func TestAdvanceCommitIndexRequiresBothJointMajorities(t *testing.T) {
+	tests := []struct {
+		name          string
+		replicated    string
+		wantCommitted bool
+	}{
+		{
+			name:          "old majority only",
+			replicated:    "node-C",
+			wantCommitted: false,
+		},
+		{
+			name:          "new majority only",
+			replicated:    "node-D",
+			wantCommitted: false,
+		},
+		{
+			name:          "both majorities",
+			replicated:    "node-B",
+			wantCommitted: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node, err := NewNode(
+				"node-A",
+				[]string{"node-B", "node-C"},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			node.configuration = ConfigurationState{
+				OldVoters: []string{"node-A", "node-B", "node-C"},
+				NewVoters: []string{"node-A", "node-B", "node-D"},
+			}
+
+			node.log = []LogEntry{
+				{Term: 1, Command: []byte("task-1")},
+			}
+			node.lastLogIndex = 1
+			node.lastLogTerm = 1
+
+			if err := node.StartElection(); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := node.becomeLeaderIfMajority(1, 2); err != nil {
+				t.Fatal(err)
+			}
+
+			node.mu.Lock()
+			node.matchIndex[tt.replicated] = 1
+
+			advanced := node.advanceCommitIndexLocked()
+			commitIndex := node.commitIndex
+			node.mu.Unlock()
+
+			if advanced != tt.wantCommitted {
+				t.Errorf(
+					"advanceCommitIndexLocked() = %v, want %v",
+					advanced,
+					tt.wantCommitted,
+				)
+			}
+
+			wantIndex := uint64(0)
+			if tt.wantCommitted {
+				wantIndex = 1
+			}
+
+			if commitIndex != wantIndex {
+				t.Errorf(
+					"commitIndex = %d, want %d",
+					commitIndex,
+					wantIndex,
+				)
+			}
+		})
+	}
+}

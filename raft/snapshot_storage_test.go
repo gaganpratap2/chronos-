@@ -12,6 +12,9 @@ func TestMemoryStorageSaveAndLoadSnapshot(t *testing.T) {
 		LastIncludedIndex: 10,
 		LastIncludedTerm:  3,
 		Data:              []byte("chronos-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(expected); err != nil {
@@ -58,6 +61,9 @@ func TestMemoryStorageSnapshotDoesNotShareData(t *testing.T) {
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  2,
 		Data:              []byte("chronos"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(original); err != nil {

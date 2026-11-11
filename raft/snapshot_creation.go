@@ -73,6 +73,7 @@ func (n *Node) CreateSnapshot() error {
 		LastIncludedIndex: snapshotIndex,
 		LastIncludedTerm:  snapshotTerm,
 		Data:              append([]byte(nil), data...),
+		Configuration:     n.configuration.Clone(),
 	}
 
 	if err := validateSnapshot(snapshot); err != nil {

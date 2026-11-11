@@ -21,6 +21,7 @@ type InstallSnapshotRequest struct {
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
 	Data              []byte
+	Configuration     ConfigurationState
 }
 
 // InstallSnapshotResponse reports whether the follower installed
@@ -48,6 +49,7 @@ func (n *Node) InstallSnapshot(
 	incoming := Snapshot{
 		LastIncludedIndex: req.LastIncludedIndex,
 		LastIncludedTerm:  req.LastIncludedTerm,
+		Configuration:     req.Configuration.Clone(),
 		Data:              append([]byte(nil), req.Data...),
 	}
 
@@ -238,6 +240,16 @@ func (n *Node) InstallSnapshot(
 
 	n.commitIndex = incoming.LastIncludedIndex
 	n.lastApplied = incoming.LastIncludedIndex
+
+	// Publish the membership configuration only after the
+	// snapshot and state-machine restoration have succeeded.
+	n.configuration = incoming.Configuration.Clone()
+	n.peers = configurationPeerIDs(n.id, n.configuration)
+
+	// A node removed from the voter set must not remain leader.
+	if !n.configuration.IsVoter(n.id) {
+		n.state = StateFollower
+	}
 
 	response.Success = true
 

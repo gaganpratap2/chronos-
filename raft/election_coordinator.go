@@ -47,6 +47,7 @@ func NewElectionCoordinator(
 }
 
 type voteResult struct {
+	peerID   string
 	response RequestVoteResponse
 	err      error
 }
@@ -84,20 +85,20 @@ func (e *ElectionCoordinator) RunElection(
 	lastLogTerm := e.node.lastLogTerm
 
 	peers := append([]string(nil), e.node.peers...)
+	configuration := e.node.configuration.Clone()
 
 	e.node.mu.RUnlock()
 
 	// The Candidate automatically votes for itself.
-	votes := 1
+	// The candidate automatically votes for itself.
+	// Track voter identities because joint consensus requires
+	// separate majorities from both configurations.
+	voters := []string{candidateID}
 
-	clusterSize := len(peers) + 1
-	majority := clusterSize/2 + 1
-
-	// A one-node cluster needs only its own vote.
-	if votes >= majority {
-		if err := e.node.becomeLeaderIfMajority(
+	if configuration.HasQuorum(voters) {
+		if err := e.node.becomeLeaderIfConfigurationQuorum(
 			electionTerm,
-			votes,
+			voters,
 		); err != nil {
 			return false, err
 		}
@@ -125,6 +126,7 @@ func (e *ElectionCoordinator) RunElection(
 			)
 
 			results <- voteResult{
+				peerID:   id,
 				response: response,
 				err:      err,
 			}
@@ -158,16 +160,17 @@ func (e *ElectionCoordinator) RunElection(
 			}
 
 			// Count only granted votes from the current term.
+			// Count only granted votes from the current term.
 			if result.response.Term == electionTerm &&
 				result.response.VoteGranted {
-				votes++
+				voters = append(voters, result.peerID)
 			}
 
-			// Step 6: Check whether a majority was reached.
-			if votes >= majority {
-				if err := e.node.becomeLeaderIfMajority(
+			// Check the active configuration's quorum requirements.
+			if configuration.HasQuorum(voters) {
+				if err := e.node.becomeLeaderIfConfigurationQuorum(
 					electionTerm,
-					votes,
+					voters,
 				); err != nil {
 					return false, err
 				}

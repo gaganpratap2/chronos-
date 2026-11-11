@@ -7,6 +7,7 @@ import (
 type Snapshot struct {
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
+	Configuration     ConfigurationState
 	Data              []byte
 }
 
@@ -18,11 +19,19 @@ type SnapshotStateMachine interface {
 var ErrInvalidSnapshot = errors.New("invalid raft snapshot")
 
 func validateSnapshot(snapshot Snapshot) error {
-	if snapshot.LastIncludedIndex == 0 && snapshot.LastIncludedTerm != 0 {
+	if snapshot.LastIncludedIndex == 0 {
+		if snapshot.LastIncludedTerm != 0 {
+			return ErrInvalidSnapshot
+		}
+
+		return nil
+	}
+
+	if snapshot.LastIncludedTerm == 0 {
 		return ErrInvalidSnapshot
 	}
 
-	if snapshot.LastIncludedIndex > 0 && snapshot.LastIncludedTerm == 0 {
+	if err := snapshot.Configuration.Validate(); err != nil {
 		return ErrInvalidSnapshot
 	}
 
@@ -33,6 +42,7 @@ func cloneSnapshot(snapshot Snapshot) Snapshot {
 	return Snapshot{
 		LastIncludedIndex: snapshot.LastIncludedIndex,
 		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		Configuration:     snapshot.Configuration.Clone(),
 		Data:              append([]byte(nil), snapshot.Data...),
 	}
 }

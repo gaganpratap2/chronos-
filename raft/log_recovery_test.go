@@ -70,6 +70,9 @@ func TestNewNodeRestoresLogAfterSnapshot(t *testing.T) {
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("snapshot-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"A", "B", "C"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(snapshot); err != nil {
@@ -117,6 +120,9 @@ func TestNewNodeRestoresOverlappingLogAfterSnapshot(t *testing.T) {
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("snapshot-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"A", "B", "C"},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +173,9 @@ func TestNewNodeRejectsOverlappingLogWithMismatchedSnapshotTerm(t *testing.T) {
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("snapshot-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"A", "B", "C"},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}

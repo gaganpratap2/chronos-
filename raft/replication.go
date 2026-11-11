@@ -81,10 +81,7 @@ func (n *Node) ReplicateToPeer(
 			return false, ErrInvalidNextIndex
 		}
 
-		entries = append(entries, LogEntry{
-			Term:    entry.Term,
-			Command: append([]byte(nil), entry.Command...),
-		})
+		entries = append(entries, cloneLogEntry(entry))
 	}
 
 	req := AppendEntriesRequest{

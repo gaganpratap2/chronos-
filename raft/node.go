@@ -33,6 +33,7 @@ type Node struct {
 	snapshot      Snapshot
 	snapshotIndex uint64
 	snapshotTerm  uint64
+	configuration ConfigurationState
 }
 
 // NewNode creates a new Raft node.
@@ -74,11 +75,42 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 		return nil, err
 	}
 
-	if hardState.VotedFor != "" {
-		validVoter := hardState.VotedFor == id
+	initialConfiguration := ConfigurationState{
+		OldVoters: append([]string{id}, peers...),
+	}
 
-		for _, peerID := range peers {
-			if peerID == hardState.VotedFor {
+	configuration := initialConfiguration.Clone()
+	hasPersistedConfiguration := false
+
+	if configurationStorage, ok := storage.(ConfigurationStorage); ok {
+		persistedConfiguration, loadErr := configurationStorage.LoadConfiguration()
+
+		switch {
+		case loadErr == nil:
+			if err := persistedConfiguration.Validate(); err != nil {
+				return nil, err
+			}
+
+			configuration = persistedConfiguration.Clone()
+			hasPersistedConfiguration = true
+
+		case errors.Is(loadErr, ErrConfigurationNotFound):
+			if err := configurationStorage.SaveConfiguration(
+				initialConfiguration,
+			); err != nil {
+				return nil, err
+			}
+
+		default:
+			return nil, loadErr
+		}
+	}
+
+	if hardState.VotedFor != "" && !hasPersistedConfiguration {
+		validVoter := false
+
+		for _, voter := range configuration.OldVoters {
+			if voter == hardState.VotedFor {
 				validVoter = true
 				break
 			}
@@ -89,15 +121,16 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 		}
 	}
 
-	peerCopy := append([]string(nil), peers...)
+	peerCopy := configurationPeerIDs(id, configuration)
 
 	node := &Node{
-		id:          id,
-		state:       StateFollower,
-		currentTerm: hardState.CurrentTerm,
-		votedFor:    hardState.VotedFor,
-		peers:       peerCopy,
-		storage:     storage,
+		id:            id,
+		state:         StateFollower,
+		currentTerm:   hardState.CurrentTerm,
+		votedFor:      hardState.VotedFor,
+		peers:         peerCopy,
+		storage:       storage,
+		configuration: configuration,
 	}
 
 	// Load snapshot metadata when the storage supports snapshots.
@@ -236,6 +269,91 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 				node.lastLogTerm = node.log[len(node.log)-1].Term
 			}
 		}
+	}
+
+	// Restore the authoritative membership from the snapshot.
+	// A snapshot includes all configuration changes through its index.
+	if node.snapshotIndex > 0 {
+		node.configuration = node.snapshot.Configuration.Clone()
+	}
+
+	// Recover configurations applied after the snapshot.
+	if configurationStorage, ok := storage.(IndexedConfigurationStorage); ok {
+		records, err := configurationStorage.LoadConfigurationRecords()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"load indexed configurations: %w",
+				err,
+			)
+		}
+
+		current := node.configuration.Clone()
+		previousIndex := uint64(0)
+
+		for _, record := range records {
+			if record.Index == 0 || record.Index <= previousIndex {
+				return nil, ErrInvalidConfigurationIndex
+			}
+			previousIndex = record.Index
+
+			if err := record.Configuration.Validate(); err != nil {
+				return nil, err
+			}
+
+			// The snapshot already represents this configuration history.
+			if record.Index <= node.snapshotIndex {
+				if record.Index == node.snapshotIndex &&
+					(!equalVoterSets(
+						record.Configuration.OldVoters,
+						current.OldVoters,
+					) || !equalVoterSets(
+						record.Configuration.NewVoters,
+						current.NewVoters,
+					)) {
+					return nil, ErrConfigurationIndexConflict
+				}
+
+				continue
+			}
+
+			// Every configuration applied after the snapshot
+			// must correspond to an actual configuration log entry.
+			entry, exists := node.logEntryAt(record.Index)
+			if !exists ||
+				entry.Type != LogEntryConfiguration ||
+				entry.Configuration == nil {
+				return nil, fmt.Errorf(
+					"%w: no configuration log entry at index %d",
+					ErrConfigurationIndexConflict,
+					record.Index,
+				)
+			}
+
+			if !equalVoterSets(
+				entry.Configuration.OldVoters,
+				record.Configuration.OldVoters,
+			) || !equalVoterSets(
+				entry.Configuration.NewVoters,
+				record.Configuration.NewVoters,
+			) {
+				return nil, ErrConfigurationIndexConflict
+			}
+
+			if err := ValidateConfigurationTransition(
+				current,
+				record.Configuration,
+			); err != nil {
+				return nil, err
+			}
+
+			current = record.Configuration.Clone()
+		}
+
+		node.configuration = current
+		node.peers = configurationPeerIDs(
+			node.id,
+			node.configuration,
+		)
 	}
 
 	return node, nil

@@ -47,16 +47,15 @@ func (n *Node) SetStateMachine(
 	return n.applyCommittedEntriesLocked(stateMachine)
 }
 
-// applyCommittedEntriesIfConfigured applies committed entries
-// when a state machine has been registered.
+// applyCommittedEntriesIfConfigured applies committed entries,
+// including configuration entries, when possible.
 func (n *Node) applyCommittedEntriesIfConfigured() error {
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
 	n.mu.RLock()
 	stateMachine := n.stateMachine
 	n.mu.RUnlock()
 
-	if stateMachine == nil {
-		return nil
-	}
-
-	return n.ApplyCommittedEntries(stateMachine)
+	return n.applyCommittedEntriesLocked(stateMachine)
 }

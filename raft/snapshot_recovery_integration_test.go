@@ -27,6 +27,9 @@ func TestInstalledSnapshotRestoresAfterDiskRestart(t *testing.T) {
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  2,
 		Data:              []byte("recovered-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("install snapshot: %v", err)

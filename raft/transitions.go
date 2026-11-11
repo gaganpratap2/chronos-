@@ -13,6 +13,7 @@ var (
 	ErrTermNotHigher       = errors.New("received term is not higher")
 	ErrInsufficientVotes   = errors.New("candidate did not receive a majority")
 	ErrElectionTermChanged = errors.New("election term has changed")
+	ErrNotVoter            = errors.New("raft node is not a configured voter")
 )
 
 // start election
@@ -33,6 +34,10 @@ func (n *Node) StartElection() error {
 
 	if n.state == StateLeader {
 		return ErrAlreadyLeader
+	}
+
+	if !n.configuration.IsVoter(n.id) {
+		return ErrNotVoter
 	}
 
 	if n.currentTerm == math.MaxUint64 {
@@ -68,6 +73,10 @@ func (n *Node) becomeLeaderIfMajority(electionTerm uint64, votes int) error {
 
 	if n.currentTerm != electionTerm {
 		return ErrElectionTermChanged
+	}
+
+	if !n.configuration.IsVoter(n.id) {
+		return ErrNotVoter
 	}
 
 	majority := (len(n.peers)+1)/2 + 1
@@ -109,6 +118,37 @@ func (n *Node) ObserveHigherTerm(term uint64) error {
 	n.currentTerm = term
 	n.state = StateFollower
 	n.votedFor = ""
+
+	return nil
+}
+
+// becomeLeaderIfConfigurationQuorum promotes the candidate only
+// when its votes satisfy the active configuration.
+func (n *Node) becomeLeaderIfConfigurationQuorum(
+	electionTerm uint64,
+	voters []string,
+) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != StateCandidate {
+		return ErrNotCandidate
+	}
+
+	if n.currentTerm != electionTerm {
+		return ErrElectionTermChanged
+	}
+
+	if !n.configuration.IsVoter(n.id) {
+		return ErrNotVoter
+	}
+
+	if !n.configuration.HasQuorum(voters) {
+		return ErrInsufficientVotes
+	}
+
+	n.state = StateLeader
+	n.initializeReplicationProgressLocked()
 
 	return nil
 }

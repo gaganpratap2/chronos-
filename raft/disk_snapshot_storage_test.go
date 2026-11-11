@@ -20,6 +20,9 @@ func TestDiskStorageSaveAndLoadSnapshot(t *testing.T) {
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  2,
 		Data:              []byte("state-machine-data"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(expected); err != nil {
@@ -50,6 +53,9 @@ func TestDiskStorageSnapshotRecoversAfterReopen(t *testing.T) {
 		LastIncludedIndex: 8,
 		LastIncludedTerm:  3,
 		Data:              []byte("recovered-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(expected); err != nil {
@@ -91,12 +97,18 @@ func TestDiskStorageLoadsLatestSnapshot(t *testing.T) {
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  2,
 		Data:              []byte("first"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	second := Snapshot{
 		LastIncludedIndex: 10,
 		LastIncludedTerm:  4,
 		Data:              []byte("second"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(first); err != nil {
@@ -131,6 +143,9 @@ func TestDiskStorageTruncatesIncompleteFinalSnapshot(t *testing.T) {
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  2,
 		Data:              []byte("valid"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(expected); err != nil {
@@ -184,6 +199,9 @@ func TestDiskStorageTruncatesIncompleteFinalSnapshot(t *testing.T) {
 		LastIncludedIndex: 8,
 		LastIncludedTerm:  3,
 		Data:              []byte("next"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := reopened.SaveSnapshot(next); err != nil {
@@ -285,6 +303,9 @@ func TestDiskStorageSnapshotOperationsAfterClose(t *testing.T) {
 		LastIncludedIndex: 1,
 		LastIncludedTerm:  1,
 		Data:              []byte("data"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(snapshot); !errors.Is(err, os.ErrClosed) {
@@ -304,6 +325,9 @@ func TestDiskStorageSaveSnapshotRecoversIncompleteTailBeforeAppend(t *testing.T)
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  2,
 		Data:              []byte("first"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(first); err != nil {
@@ -346,6 +370,9 @@ func TestDiskStorageSaveSnapshotRecoversIncompleteTailBeforeAppend(t *testing.T)
 		LastIncludedIndex: 8,
 		LastIncludedTerm:  3,
 		Data:              []byte("second"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := reopened.SaveSnapshot(second); err != nil {

@@ -17,6 +17,9 @@ func newSnapshotRestoreTestNode(
 		LastIncludedIndex: 2,
 		LastIncludedTerm:  1,
 		Data:              []byte("restored-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := storage.SaveSnapshot(snapshot); err != nil {

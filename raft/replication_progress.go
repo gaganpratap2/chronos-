@@ -88,7 +88,6 @@ func (n *Node) advanceCommitIndexLocked() bool {
 	}
 
 	lastLogIndex := n.lastLogIndexLocked()
-	majority := (len(n.peers)+1)/2 + 1
 
 	// Search backwards to find the highest index that can be committed.
 	for index := lastLogIndex; index > n.commitIndex; index-- {
@@ -97,20 +96,40 @@ func (n *Node) advanceCommitIndexLocked() bool {
 			continue
 		}
 
-		replicatedCount := 0
-
-		// Count the leader and followers that replicated this entry.
-		for _, peerID := range append([]string{n.id}, n.peers...) {
-			if n.matchIndex[peerID] >= index {
-				replicatedCount++
-			}
-		}
-
-		if replicatedCount >= majority {
+		if n.hasReplicationQuorumLocked(index) {
 			n.commitIndex = index
 			return true
 		}
 	}
 
 	return false
+}
+
+// hasReplicationQuorumLocked checks whether an entry has been
+// replicated by a quorum of the active configuration.
+//
+// The caller must hold n.mu.
+func (n *Node) hasReplicationQuorumLocked(index uint64) bool {
+	voters := make([]string, 0)
+
+	seen := make(map[string]struct{})
+
+	allVoters := append(
+		append([]string(nil), n.configuration.OldVoters...),
+		n.configuration.NewVoters...,
+	)
+
+	for _, voter := range allVoters {
+		if _, exists := seen[voter]; exists {
+			continue
+		}
+
+		seen[voter] = struct{}{}
+
+		if n.matchIndex[voter] >= index {
+			voters = append(voters, voter)
+		}
+	}
+
+	return n.configuration.HasQuorum(voters)
 }

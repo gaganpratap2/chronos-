@@ -18,6 +18,9 @@ func TestValidateSnapshotAcceptsValidSnapshot(t *testing.T) {
 		LastIncludedIndex: 10,
 		LastIncludedTerm:  3,
 		Data:              []byte("chronos-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	if err := validateSnapshot(snapshot); err != nil {
@@ -56,6 +59,9 @@ func TestCloneSnapshotCopiesData(t *testing.T) {
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  2,
 		Data:              []byte("chronos-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"node-A"},
+		},
 	}
 
 	cloned := cloneSnapshot(original)
