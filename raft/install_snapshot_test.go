@@ -575,3 +575,93 @@ func TestInstallSnapshotRestoresConfiguration(t *testing.T) {
 		t.Fatalf("peers = %v, want %v", node.Peers(), expectedPeers)
 	}
 }
+
+func TestInstallSnapshotRejectsConflictingBoundaryConfiguration(
+	t *testing.T,
+) {
+	storage := NewMemoryStorage()
+	node, _ := newSnapshotInstallTestNode(t, storage)
+
+	conflicting := ConfigurationState{
+		OldVoters: []string{"follower-A", "leader-A", "node-C"},
+	}
+
+	if err := storage.SaveConfigurationAt(3, conflicting); err != nil {
+		t.Fatalf("save indexed configuration: %v", err)
+	}
+
+	_, err := node.InstallSnapshot(InstallSnapshotRequest{
+		Term:              4,
+		LeaderID:          "leader-A",
+		LastIncludedIndex: 3,
+		LastIncludedTerm:  2,
+		Data:              []byte("new-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
+	})
+
+	if !errors.Is(err, ErrConfigurationIndexConflict) {
+		t.Fatalf(
+			"expected configuration conflict, got %v",
+			err,
+		)
+	}
+
+	saved, err := storage.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+
+	if saved.LastIncludedIndex != 0 {
+		t.Errorf(
+			"snapshot was persisted despite configuration conflict: index %d",
+			saved.LastIncludedIndex,
+		)
+	}
+}
+
+func TestInstallSnapshotRejectsConfigurationWithoutRetainedLogEntry(
+	t *testing.T,
+) {
+	storage := NewMemoryStorage()
+	node, _ := newSnapshotInstallTestNode(t, storage)
+
+	laterConfiguration := ConfigurationState{
+		OldVoters: []string{"follower-A", "leader-A", "node-C"},
+	}
+
+	if err := storage.SaveConfigurationAt(4, laterConfiguration); err != nil {
+		t.Fatalf("save indexed configuration: %v", err)
+	}
+
+	_, err := node.InstallSnapshot(InstallSnapshotRequest{
+		Term:              4,
+		LeaderID:          "leader-A",
+		LastIncludedIndex: 3,
+		LastIncludedTerm:  2,
+		Data:              []byte("new-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
+	})
+
+	if !errors.Is(err, ErrConfigurationIndexConflict) {
+		t.Fatalf(
+			"expected configuration conflict, got %v",
+			err,
+		)
+	}
+
+	saved, err := storage.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+
+	if saved.LastIncludedIndex != 0 {
+		t.Errorf(
+			"snapshot was persisted despite configuration conflict: index %d",
+			saved.LastIncludedIndex,
+		)
+	}
+}

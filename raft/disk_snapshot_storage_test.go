@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -388,5 +389,122 @@ func TestDiskStorageSaveSnapshotRecoversIncompleteTailBeforeAppend(t *testing.T)
 		got.LastIncludedTerm != second.LastIncludedTerm ||
 		string(got.Data) != string(second.Data) {
 		t.Fatalf("expected %+v, got %+v", second, got)
+	}
+}
+
+func TestDiskStorageRestoresSnapshotAndLaterConfigurationAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft-state.log")
+
+	storage, err := NewDiskStorage(path)
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+
+	// Create the initial node so its initial membership is persisted.
+	_, err = NewNodeWithStorage(
+		"node-A",
+		[]string{"node-B"},
+		storage,
+	)
+	if err != nil {
+		storage.Close()
+		t.Fatalf("create initial node: %v", err)
+	}
+
+	initial := ConfigurationState{
+		OldVoters: []string{"node-A", "node-B"},
+	}
+
+	joint := ConfigurationState{
+		OldVoters: []string{"node-A", "node-B"},
+		NewVoters: []string{"node-A", "node-C"},
+	}
+
+	if err := storage.SaveHardState(HardState{
+		CurrentTerm: 3,
+	}); err != nil {
+		storage.Close()
+		t.Fatalf("save hard state: %v", err)
+	}
+
+	// Snapshot covers the initial configuration at index 1.
+	if err := storage.SaveSnapshot(Snapshot{
+		LastIncludedIndex: 1,
+		LastIncludedTerm:  1,
+		Data:              []byte("snapshot-state"),
+		Configuration:     initial.Clone(),
+	}); err != nil {
+		storage.Close()
+		t.Fatalf("save snapshot: %v", err)
+	}
+
+	// Index 2 contains the later joint-consensus configuration.
+	if err := storage.SaveLog(LogState{
+		FirstIndex: 2,
+		Entries: []LogEntry{
+			{
+				Term:          2,
+				Type:          LogEntryConfiguration,
+				Configuration: &joint,
+			},
+		},
+	}); err != nil {
+		storage.Close()
+		t.Fatalf("save retained log: %v", err)
+	}
+
+	if err := storage.SaveConfigurationAt(2, joint); err != nil {
+		storage.Close()
+		t.Fatalf("save indexed configuration: %v", err)
+	}
+
+	if err := storage.Close(); err != nil {
+		t.Fatalf("close storage: %v", err)
+	}
+
+	// Simulate a process restart.
+	reopened, err := NewDiskStorage(path)
+	if err != nil {
+		t.Fatalf("reopen storage: %v", err)
+	}
+	defer reopened.Close()
+
+	// Supplied peers are deliberately outdated.
+	node, err := NewNodeWithStorage(
+		"node-A",
+		[]string{"node-X"},
+		reopened,
+	)
+	if err != nil {
+		t.Fatalf("restore node after restart: %v", err)
+	}
+
+	if !reflect.DeepEqual(node.configuration, joint) {
+		t.Fatalf(
+			"restored configuration = %+v, want %+v",
+			node.configuration,
+			joint,
+		)
+	}
+
+	wantPeers := []string{"node-B", "node-C"}
+	if !reflect.DeepEqual(node.Peers(), wantPeers) {
+		t.Fatalf(
+			"restored peers = %v, want %v",
+			node.Peers(),
+			wantPeers,
+		)
+	}
+
+	if node.CurrentTerm() != 3 {
+		t.Fatalf("current term = %d, want 3", node.CurrentTerm())
+	}
+
+	if node.snapshotIndex != 1 {
+		t.Fatalf("snapshot index = %d, want 1", node.snapshotIndex)
+	}
+
+	if node.lastLogIndex != 2 {
+		t.Fatalf("last log index = %d, want 2", node.lastLogIndex)
 	}
 }

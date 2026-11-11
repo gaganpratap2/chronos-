@@ -134,6 +134,14 @@ func (n *Node) InstallSnapshot(
 		return response, ErrInvalidLogState
 	}
 
+	if err := validateInstalledSnapshotConfiguration(
+		n.storage,
+		incoming,
+		retainedLog,
+	); err != nil {
+		return response, err
+	}
+
 	// Load the previous persisted log so a failed installation
 	// can attempt to restore it.
 	logStorage, hasLogStorage := n.storage.(LogStorage)
@@ -254,4 +262,94 @@ func (n *Node) InstallSnapshot(
 	response.Success = true
 
 	return response, nil
+}
+
+// validateInstalledSnapshotConfiguration checks that indexed configuration
+// records remain consistent with an incoming snapshot and its retained log.
+func validateInstalledSnapshotConfiguration(
+	storage Storage,
+	snapshot Snapshot,
+	retainedLog []LogEntry,
+) error {
+	configurationStorage, ok := storage.(IndexedConfigurationStorage)
+	if !ok {
+		return nil
+	}
+
+	records, err := configurationStorage.LoadConfigurationRecords()
+	if err != nil {
+		return fmt.Errorf("load indexed configurations before snapshot installation: %w", err)
+	}
+
+	current := snapshot.Configuration.Clone()
+	previousIndex := uint64(0)
+
+	for _, record := range records {
+		if record.Index == 0 || record.Index <= previousIndex {
+			return ErrInvalidConfigurationIndex
+		}
+		previousIndex = record.Index
+
+		if err := record.Configuration.Validate(); err != nil {
+			return err
+		}
+
+		if record.Index < snapshot.LastIncludedIndex {
+			continue
+		}
+
+		if record.Index == snapshot.LastIncludedIndex {
+			if !equalVoterSets(
+				record.Configuration.OldVoters,
+				current.OldVoters,
+			) || !equalVoterSets(
+				record.Configuration.NewVoters,
+				current.NewVoters,
+			) {
+				return ErrConfigurationIndexConflict
+			}
+
+			continue
+		}
+
+		offset := record.Index - snapshot.LastIncludedIndex - 1
+		if offset >= uint64(len(retainedLog)) {
+			return fmt.Errorf(
+				"%w: no configuration log entry at index %d",
+				ErrConfigurationIndexConflict,
+				record.Index,
+			)
+		}
+
+		entry := retainedLog[offset]
+		if entry.Type != LogEntryConfiguration ||
+			entry.Configuration == nil {
+			return fmt.Errorf(
+				"%w: no configuration log entry at index %d",
+				ErrConfigurationIndexConflict,
+				record.Index,
+			)
+		}
+
+		if !equalVoterSets(
+			entry.Configuration.OldVoters,
+			record.Configuration.OldVoters,
+		) || !equalVoterSets(
+			entry.Configuration.NewVoters,
+			record.Configuration.NewVoters,
+		) {
+			return ErrConfigurationIndexConflict
+		}
+
+		if err := ValidateConfigurationTransition(
+			current,
+			record.Configuration,
+		); err != nil {
+			return err
+		}
+
+		current = record.Configuration.Clone()
+	}
+
+	return nil
 }
