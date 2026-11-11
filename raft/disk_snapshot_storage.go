@@ -26,12 +26,19 @@ func (s *DiskStorage) LoadSnapshot() (Snapshot, error) {
 		os.O_CREATE|os.O_RDWR,
 		0600,
 	)
-
 	if err != nil {
 		return Snapshot{}, err
 	}
 	defer file.Close()
 
+	return readLatestSnapshot(file)
+}
+
+// readLatestSnapshot loads the latest valid snapshot record.
+//
+// If the final record is incomplete, it truncates that record.
+// A complete but corrupt record is rejected.
+func readLatestSnapshot(file *os.File) (Snapshot, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return Snapshot{}, err
 	}
@@ -45,11 +52,11 @@ func (s *DiskStorage) LoadSnapshot() (Snapshot, error) {
 		line, err := reader.ReadString('\n')
 
 		if err == io.EOF {
-			// Discard an incomplete final record.
 			if len(line) > 0 {
 				if truncateErr := file.Truncate(validSize); truncateErr != nil {
 					return Snapshot{}, truncateErr
 				}
+
 				if syncErr := file.Sync(); syncErr != nil {
 					return Snapshot{}, syncErr
 				}
@@ -85,7 +92,7 @@ func (s *DiskStorage) LoadSnapshot() (Snapshot, error) {
 	return cloneSnapshot(latest), nil
 }
 
-func (s *DiskStorage) SaveSnapshot(snapshot Snapshot) error {
+func (s *DiskStorage) SaveSnapshot(snapshot Snapshot) (resultErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -97,6 +104,28 @@ func (s *DiskStorage) SaveSnapshot(snapshot Snapshot) error {
 		return err
 	}
 
+	file, err := os.OpenFile(
+		s.path+".snapshots",
+		os.O_CREATE|os.O_RDWR,
+		0600,
+	)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if closeErr := file.Close(); resultErr == nil {
+			resultErr = closeErr
+		}
+	}()
+
+	// Recover the journal before appending.
+	// This removes an incomplete final record and rejects
+	// any complete corrupt record.
+	if _, err := readLatestSnapshot(file); err != nil {
+		return fmt.Errorf("recover snapshot journal before append: %w", err)
+	}
+
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -104,36 +133,22 @@ func (s *DiskStorage) SaveSnapshot(snapshot Snapshot) error {
 
 	data = append(data, '\n')
 
-	file, err := os.OpenFile(
-		s.path+".snapshots",
-		os.O_CREATE|os.O_RDWR,
-		0600,
-	)
-
-	if err != nil {
-		return err
-	}
-
 	if _, err := file.Seek(0, io.SeekEnd); err != nil {
-		file.Close()
 		return err
 	}
 
 	n, err := file.Write(data)
 	if err != nil {
-		file.Close()
 		return err
 	}
 
 	if n != len(data) {
-		file.Close()
 		return errors.New("incomplete snapshot write")
 	}
 
 	if err := file.Sync(); err != nil {
-		file.Close()
 		return err
 	}
 
-	return file.Close()
+	return nil
 }

@@ -45,7 +45,6 @@ func (n *Node) InstallSnapshot(
 		Success: false,
 	}
 
-	// Validate the request before changing persistent or in-memory state.
 	incoming := Snapshot{
 		LastIncludedIndex: req.LastIncludedIndex,
 		LastIncludedTerm:  req.LastIncludedTerm,
@@ -55,7 +54,8 @@ func (n *Node) InstallSnapshot(
 	if req.Term == 0 ||
 		req.LeaderID == "" ||
 		validateSnapshot(incoming) != nil ||
-		incoming.LastIncludedIndex == 0 {
+		incoming.LastIncludedIndex == 0 ||
+		incoming.LastIncludedIndex == ^uint64(0) {
 		return response, ErrInvalidInstallSnapshot
 	}
 
@@ -64,7 +64,7 @@ func (n *Node) InstallSnapshot(
 		return response, nil
 	}
 
-	// A newer leader term must be persisted before updating memory.
+	// Persist a higher term before updating memory.
 	if req.Term > n.currentTerm {
 		hardState := HardState{
 			CurrentTerm: req.Term,
@@ -82,90 +82,40 @@ func (n *Node) InstallSnapshot(
 	n.state = StateFollower
 	response.Term = n.currentTerm
 
-	// An older or duplicate snapshot cannot replace newer local state.
 	if incoming.LastIncludedIndex <= n.snapshotIndex {
 		return response, ErrSnapshotBehind
 	}
 
-	// A snapshot cannot roll back already committed entries.
 	if incoming.LastIncludedIndex < n.commitIndex {
 		return response, ErrSnapshotBehind
 	}
 
-	// A snapshot cannot move beyond the leader's current term.
 	if incoming.LastIncludedTerm > req.Term {
 		return response, ErrInvalidInstallSnapshot
 	}
 
-	// Restore the state machine before publishing the new snapshot.
+	// Validate state-machine support before changing persistent state.
+	var restorer SnapshotRestorer
+
 	if n.stateMachine != nil {
-		snapshotStorage, ok := n.storage.(SnapshotStorage)
-		if !ok {
-			return response, ErrSnapshotStorageUnavailable
-		}
+		var supported bool
 
-		var restorer SnapshotRestorer
-
-		if n.stateMachine != nil {
-			var supported bool
-
-			restorer, supported = n.stateMachine.(SnapshotRestorer)
-			if !supported {
-				return response, ErrSnapshotRestoreUnsupported
-			}
-		}
-
-		// Keep the previous snapshot so we can roll back persistence
-		// if restoring the incoming snapshot fails.
-		previousSnapshot := cloneSnapshot(n.snapshot)
-
-		// Persist before modifying the state machine.
-		if err := snapshotStorage.SaveSnapshot(incoming); err != nil {
-			return response, err
-		}
-
-		// Restore the state machine only after persistence succeeds.
-		if restorer != nil {
-			if err := restorer.Restore(
-				append([]byte(nil), incoming.Data...),
-			); err != nil {
-				restoreErr := fmt.Errorf(
-					"restore incoming snapshot: %w",
-					err,
-				)
-
-				// Restore the previous persisted snapshot.
-				if rollbackErr := snapshotStorage.SaveSnapshot(
-					previousSnapshot,
-				); rollbackErr != nil {
-					return response, errors.Join(
-						restoreErr,
-						fmt.Errorf(
-							"rollback persisted snapshot: %w",
-							rollbackErr,
-						),
-					)
-				}
-
-				return response, restoreErr
-			}
+		restorer, supported = n.stateMachine.(SnapshotRestorer)
+		if !supported {
+			return response, ErrSnapshotRestoreUnsupported
 		}
 	}
 
-	// Snapshot persistence must succeed before changing the log.
 	snapshotStorage, ok := n.storage.(SnapshotStorage)
 	if !ok {
 		return response, ErrSnapshotStorageUnavailable
 	}
 
-	if err := snapshotStorage.SaveSnapshot(incoming); err != nil {
-		return response, err
-	}
-
-	// Preserve the suffix only if the local log agrees at the boundary.
+	// Preserve the local suffix only when its boundary term matches.
 	var retainedLog []LogEntry
 
 	localTerm, exists := n.termAt(incoming.LastIncludedIndex)
+
 	if exists && localTerm == incoming.LastIncludedTerm {
 		offset := incoming.LastIncludedIndex - n.snapshotIndex
 
@@ -177,6 +127,103 @@ func (n *Node) InstallSnapshot(
 		}
 	}
 
+	if uint64(len(retainedLog)) >
+		^uint64(0)-incoming.LastIncludedIndex {
+		return response, ErrInvalidLogState
+	}
+
+	// Load the previous persisted log so a failed installation
+	// can attempt to restore it.
+	logStorage, hasLogStorage := n.storage.(LogStorage)
+
+	var previousLog LogState
+
+	if hasLogStorage {
+		var err error
+
+		previousLog, err = logStorage.LoadLog()
+		if err != nil {
+			return response, fmt.Errorf(
+				"load previous log before snapshot installation: %w",
+				err,
+			)
+		}
+
+		if err := validateLogState(previousLog); err != nil {
+			return response, err
+		}
+	}
+
+	previousSnapshot := cloneSnapshot(n.snapshot)
+
+	// Roll back both persistent records if a later installation
+	// step fails.
+
+	rollback := func(cause error) error {
+		var rollbackErrors []error
+
+		// Restore the previous log first.
+		logRollbackSucceeded := true
+
+		if hasLogStorage {
+			if err := logStorage.SaveLog(previousLog); err != nil {
+				logRollbackSucceeded = false
+
+				rollbackErrors = append(
+					rollbackErrors,
+					fmt.Errorf("rollback persisted log: %w", err),
+				)
+			}
+		}
+
+		// Restore the previous snapshot only when the previous
+		// log has been restored successfully.
+		if logRollbackSucceeded {
+			if err := snapshotStorage.SaveSnapshot(previousSnapshot); err != nil {
+				rollbackErrors = append(
+					rollbackErrors,
+					fmt.Errorf("rollback persisted snapshot: %w", err),
+				)
+			}
+		}
+
+		return errors.Join(
+			append([]error{cause}, rollbackErrors...)...,
+		)
+	}
+
+	// Persist the snapshot before changing the state machine.
+	if err := snapshotStorage.SaveSnapshot(incoming); err != nil {
+		return response, err
+	}
+
+	// Persist the matching retained log suffix.
+	if hasLogStorage {
+		logState := LogState{
+			FirstIndex: incoming.LastIncludedIndex + 1,
+			Entries:    retainedLog,
+		}
+
+		if err := logStorage.SaveLog(logState); err != nil {
+			return response, rollback(
+				fmt.Errorf("persist retained log: %w", err),
+			)
+		}
+	}
+
+	// Restore the state machine only after both persistent records
+	// have been saved successfully.
+	if restorer != nil {
+		if err := restorer.Restore(
+			append([]byte(nil), incoming.Data...),
+		); err != nil {
+			return response, rollback(
+				fmt.Errorf("restore incoming snapshot: %w", err),
+			)
+		}
+	}
+
+	// Publish the installed snapshot and retained log in memory.
 	n.snapshot = cloneSnapshot(incoming)
 	n.snapshotIndex = incoming.LastIncludedIndex
 	n.snapshotTerm = incoming.LastIncludedTerm

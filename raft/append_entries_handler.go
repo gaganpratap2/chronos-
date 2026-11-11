@@ -74,18 +74,31 @@ func (n *Node) appendEntriesLocked(
 		}
 	}
 
+	// Work on a candidate copy. Do not modify n.log yet.
+	candidate := cloneLogState(LogState{
+		FirstIndex: 1,
+		Entries:    n.log,
+	}).Entries
+
 	// Find the first conflicting entry.
 	for i, incoming := range req.Entries {
-		index := req.PrevLogIndex + uint64(i) + 1
+		if n.lastLogIndexLocked() == ^uint64(0) {
+			return response, ErrInvalidLogState
+		}
 
-		if index > n.lastLogIndexLocked() {
+		if uint64(i) > ^uint64(0)-req.PrevLogIndex-1 {
+			return response, ErrInvalidLogState
+		}
+
+		index := req.PrevLogIndex + uint64(i) + 1
+		candidateLastIndex := n.snapshotIndex + uint64(len(candidate))
+
+		if index > candidateLastIndex {
 			break
 		}
 
-		existing, exists := n.logEntryAt(index)
-		if !exists {
-			return response, nil
-		}
+		offset := index - n.snapshotIndex - 1
+		existing := candidate[offset]
 
 		if existing.Term != incoming.Term {
 			// Never overwrite an entry already committed.
@@ -93,24 +106,50 @@ func (n *Node) appendEntriesLocked(
 				return response, nil
 			}
 
-			// Convert the absolute index into a slice offset.
-			offset := index - n.snapshotIndex - 1
-			n.log = n.log[:offset]
+			// Truncate only the candidate.
+			candidate = candidate[:offset]
 			break
 		}
 	}
 
 	// Append entries that are not already present.
 	for i, incoming := range req.Entries {
-		index := req.PrevLogIndex + uint64(i) + 1
+		if uint64(i) > ^uint64(0)-req.PrevLogIndex-1 {
+			return response, ErrInvalidLogState
+		}
 
-		if index > n.lastLogIndexLocked() {
-			n.log = append(n.log, LogEntry{
+		index := req.PrevLogIndex + uint64(i) + 1
+		candidateLastIndex := n.snapshotIndex + uint64(len(candidate))
+
+		if index > candidateLastIndex {
+			candidate = append(candidate, LogEntry{
 				Term:    incoming.Term,
 				Command: bytes.Clone(incoming.Command),
 			})
 		}
 	}
+
+	// Persist the complete candidate before publishing it in memory.
+	if len(req.Entries) > 0 {
+		if n.snapshotIndex == ^uint64(0) {
+			return response, ErrInvalidLogState
+		}
+
+		if logStorage, ok := n.storage.(LogStorage); ok {
+			logState := LogState{
+				FirstIndex: n.snapshotIndex + 1,
+				Entries:    candidate,
+			}
+
+			if err := logStorage.SaveLog(logState); err != nil {
+				return response, err
+			}
+		}
+	}
+
+	// Persistence succeeded (or storage does not support LogStorage).
+	// Now publish the candidate in memory.
+	n.log = candidate
 
 	// Synchronize absolute log metadata.
 	n.lastLogIndex = n.lastLogIndexLocked()

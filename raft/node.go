@@ -123,6 +123,121 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 		node.lastLogTerm = snapshot.LastIncludedTerm
 	}
 
+	// Restore retained log entries when storage supports log persistence.
+	// if logStorage, ok := storage.(LogStorage); ok {
+	// 	logState, err := logStorage.LoadLog()
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+
+	// 	if err := validateLogState(logState); err != nil {
+	// 		return nil, err
+	// 	}
+
+	// 	// A retained log must begin immediately after the snapshot.
+	// 	if len(logState.Entries) > 0 {
+	// 		if node.snapshotIndex == ^uint64(0) {
+	// 			return nil, ErrInvalidLogState
+	// 		}
+
+	// 		expectedFirstIndex := node.snapshotIndex + 1
+
+	// 		if logState.FirstIndex != expectedFirstIndex {
+	// 			return nil, fmt.Errorf(
+	// 				"%w: first index is %d, expected %d",
+	// 				ErrInvalidLogState,
+	// 				logState.FirstIndex,
+	// 				expectedFirstIndex,
+	// 			)
+	// 		}
+
+	// 		entryCount := uint64(len(logState.Entries))
+
+	// 		if entryCount > ^uint64(0)-node.snapshotIndex {
+	// 			return nil, ErrInvalidLogState
+	// 		}
+
+	// 		node.log = cloneLogState(logState).Entries
+
+	// 		node.lastLogIndex = node.snapshotIndex + entryCount
+	// 		node.lastLogTerm = node.log[len(node.log)-1].Term
+	// 	}
+	// }
+
+	// Restore retained log entries when storage supports log persistence.
+	if logStorage, ok := storage.(LogStorage); ok {
+		logState, err := logStorage.LoadLog()
+		if err != nil {
+			return nil, err
+		}
+
+		if err := validateLogState(logState); err != nil {
+			return nil, err
+		}
+
+		if len(logState.Entries) > 0 {
+			firstIndex := logState.FirstIndex
+			entryCount := uint64(len(logState.Entries))
+
+			// Protect the absolute log-index calculation from overflow.
+			if entryCount-1 > ^uint64(0)-firstIndex {
+				return nil, ErrInvalidLogState
+			}
+
+			lastIndex := firstIndex + entryCount - 1
+
+			// The log must either begin immediately after the snapshot
+			// or overlap it. A gap means entries are missing.
+			if node.snapshotIndex == ^uint64(0) {
+				return nil, ErrInvalidLogState
+			}
+
+			expectedFirstIndex := node.snapshotIndex + 1
+
+			if firstIndex > expectedFirstIndex {
+				return nil, fmt.Errorf(
+					"%w: log begins at %d but snapshot requires %d",
+					ErrInvalidLogState,
+					firstIndex,
+					expectedFirstIndex,
+				)
+			}
+
+			entries := cloneLogState(logState).Entries
+
+			if firstIndex <= node.snapshotIndex {
+				// The persisted log may contain entries already
+				// included in a newer, successfully persisted snapshot.
+				if node.snapshotIndex <= lastIndex {
+					offset := node.snapshotIndex - firstIndex
+
+					// The snapshot and old log must agree at their
+					// shared boundary before we retain the suffix.
+					if entries[offset].Term != node.snapshotTerm {
+						return nil, fmt.Errorf(
+							"%w: snapshot term does not match log at index %d",
+							ErrInvalidLogState,
+							node.snapshotIndex,
+						)
+					}
+
+					entries = entries[offset+1:]
+				} else {
+					// The snapshot is newer than the entire old log.
+					// All old entries are already covered.
+					entries = nil
+				}
+			}
+
+			node.log = entries
+			node.lastLogIndex = node.lastLogIndexLocked()
+
+			if len(node.log) > 0 {
+				node.lastLogTerm = node.log[len(node.log)-1].Term
+			}
+		}
+	}
+
 	return node, nil
 }
 

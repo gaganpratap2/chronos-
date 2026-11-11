@@ -184,6 +184,39 @@ func TestCreateSnapshotCompactsAppliedEntriesAndRetainsSuffix(
 		)
 	}
 
+	savedLog, err := storage.LoadLog()
+	if err != nil {
+		t.Fatalf("load saved log: %v", err)
+	}
+
+	if savedLog.FirstIndex != 3 {
+		t.Errorf(
+			"expected saved log first index 3, got %d",
+			savedLog.FirstIndex,
+		)
+	}
+
+	if len(savedLog.Entries) != 2 {
+		t.Fatalf(
+			"expected 2 persisted log entries, got %d",
+			len(savedLog.Entries),
+		)
+	}
+
+	if string(savedLog.Entries[0].Command) != "task-3" {
+		t.Errorf(
+			"expected first persisted command task-3, got %q",
+			savedLog.Entries[0].Command,
+		)
+	}
+
+	if string(savedLog.Entries[1].Command) != "task-4" {
+		t.Errorf(
+			"expected second persisted command task-4, got %q",
+			savedLog.Entries[1].Command,
+		)
+	}
+
 	if string(saved.Data) != "state-after-task-2" {
 		t.Errorf(
 			"unexpected snapshot data: %q",
@@ -334,5 +367,131 @@ func TestCreateSnapshotRejectsSnapshotExportFailure(
 
 	if !reflect.DeepEqual(node.log, before) {
 		t.Error("log changed after snapshot export failure")
+	}
+}
+
+func TestCreateSnapshotRollsBackWhenLogPersistenceFails(t *testing.T) {
+	storage := &failingLogStorage{
+		MemoryStorage: NewMemoryStorage(),
+		failLogSaveAt: 1,
+	}
+
+	node, _ := newSnapshotCreationTestNode(t, storage)
+
+	err := node.CreateSnapshot()
+	if !errors.Is(err, errStorageUnavailable) {
+		t.Fatalf(
+			"expected log persistence error, got %v",
+			err,
+		)
+	}
+
+	// The in-memory snapshot must not be published.
+	node.mu.RLock()
+
+	if node.snapshotIndex != 0 {
+		t.Errorf(
+			"expected snapshot index 0, got %d",
+			node.snapshotIndex,
+		)
+	}
+
+	if len(node.log) != 4 {
+		t.Errorf(
+			"expected original 4 log entries, got %d",
+			len(node.log),
+		)
+	}
+
+	node.mu.RUnlock()
+
+	// The previous persisted snapshot must be restored.
+	savedSnapshot, err := storage.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+
+	if savedSnapshot.LastIncludedIndex != 0 {
+		t.Errorf(
+			"expected persisted snapshot index 0, got %d",
+			savedSnapshot.LastIncludedIndex,
+		)
+	}
+
+	// The original persisted log must remain unchanged.
+	savedLog, err := storage.LoadLog()
+	if err != nil {
+		t.Fatalf("load log: %v", err)
+	}
+
+	if len(savedLog.Entries) != 0 {
+		t.Errorf(
+			"expected original empty persisted log, got %d entries",
+			len(savedLog.Entries),
+		)
+	}
+}
+
+func TestCreateSnapshotDoesNotRollbackSnapshotWhenLogRollbackFails(
+	t *testing.T,
+) {
+	storage := &failingLogStorage{
+		MemoryStorage: NewMemoryStorage(),
+		failLogSave:   true,
+	}
+
+	node, _ := newSnapshotCreationTestNode(t, storage)
+
+	err := node.CreateSnapshot()
+
+	if !errors.Is(err, errStorageUnavailable) {
+		t.Fatalf("expected storage error, got %v", err)
+	}
+
+	// The failed operation must not publish the new snapshot in memory.
+	node.mu.RLock()
+
+	if node.snapshotIndex != 0 {
+		t.Errorf(
+			"expected in-memory snapshot index 0, got %d",
+			node.snapshotIndex,
+		)
+	}
+
+	if len(node.log) != 4 {
+		t.Errorf(
+			"expected original 4 log entries, got %d",
+			len(node.log),
+		)
+	}
+
+	node.mu.RUnlock()
+
+	// Because log rollback failed, the newer snapshot must remain
+	// persisted. Restoring the old snapshot could create a log gap.
+	savedSnapshot, err := storage.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+
+	if savedSnapshot.LastIncludedIndex != 2 {
+		t.Errorf(
+			"expected persisted snapshot index 2, got %d",
+			savedSnapshot.LastIncludedIndex,
+		)
+	}
+
+	// Both log-save attempts failed, so the original persisted log
+	// should remain unchanged in this test helper.
+	savedLog, err := storage.LoadLog()
+	if err != nil {
+		t.Fatalf("load log: %v", err)
+	}
+
+	if len(savedLog.Entries) != 0 {
+		t.Errorf(
+			"expected original empty persisted log, got %d entries",
+			len(savedLog.Entries),
+		)
 	}
 }

@@ -21,18 +21,36 @@ var (
 type snapshotInstallTestStorage struct {
 	*MemoryStorage
 
-	snapshotErr  error
-	hardStateErr error
+	snapshotErr       error
+	hardStateErr      error
+	logSaveCalls      int
+	failLogSaveAt     int
+	snapshotSaveCalls int
 }
 
 func (s *snapshotInstallTestStorage) SaveSnapshot(
 	snapshot Snapshot,
 ) error {
+	s.snapshotSaveCalls++
+
 	if s.snapshotErr != nil {
 		return s.snapshotErr
 	}
 
 	return s.MemoryStorage.SaveSnapshot(snapshot)
+}
+
+func (s *snapshotInstallTestStorage) SaveLog(
+	state LogState,
+) error {
+	s.logSaveCalls++
+
+	if s.failLogSaveAt != 0 &&
+		s.logSaveCalls == s.failLogSaveAt {
+		return errStorageUnavailable
+	}
+
+	return s.MemoryStorage.SaveLog(state)
 }
 
 func (s *snapshotInstallTestStorage) SaveHardState(
@@ -400,5 +418,98 @@ func TestInstallSnapshotHardStatePersistenceFailurePreservesTerm(
 
 	if node.snapshotIndex != 0 {
 		t.Errorf("expected snapshot index 0, got %d", node.snapshotIndex)
+	}
+}
+
+func TestInstallSnapshotDoesNotRollbackSnapshotWhenLogRollbackFails(
+	t *testing.T,
+) {
+	storage := &snapshotInstallTestStorage{
+		MemoryStorage: NewMemoryStorage(),
+		failLogSaveAt: 2,
+	}
+
+	node, stateMachine := newSnapshotInstallTestNode(t, storage)
+	stateMachine.err = errInstallSnapshotRestore
+
+	response, err := node.InstallSnapshot(InstallSnapshotRequest{
+		Term:              4,
+		LeaderID:          "leader-A",
+		LastIncludedIndex: 3,
+		LastIncludedTerm:  2,
+		Data:              []byte("new-state"),
+	})
+
+	if err == nil {
+		t.Fatal("expected snapshot installation error")
+	}
+
+	if !errors.Is(err, errInstallSnapshotRestore) {
+		t.Errorf("expected restore error, got %v", err)
+	}
+
+	if !errors.Is(err, errStorageUnavailable) {
+		t.Errorf("expected log rollback error, got %v", err)
+	}
+
+	if response.Success {
+		t.Fatal("snapshot installation must not report success")
+	}
+
+	if storage.logSaveCalls != 2 {
+		t.Errorf(
+			"expected 2 log save calls, got %d",
+			storage.logSaveCalls,
+		)
+	}
+
+	// The old snapshot must not be restored because log rollback failed.
+	if storage.snapshotSaveCalls != 1 {
+		t.Errorf(
+			"expected exactly 1 snapshot save call, got %d",
+			storage.snapshotSaveCalls,
+		)
+	}
+
+	persistedSnapshot, loadErr := storage.LoadSnapshot()
+	if loadErr != nil {
+		t.Fatalf("load persisted snapshot: %v", loadErr)
+	}
+
+	if persistedSnapshot.LastIncludedIndex != 3 {
+		t.Errorf(
+			"expected incoming snapshot index 3 to remain persisted, got %d",
+			persistedSnapshot.LastIncludedIndex,
+		)
+	}
+
+	persistedLog, loadErr := storage.LoadLog()
+	if loadErr != nil {
+		t.Fatalf("load persisted log: %v", loadErr)
+	}
+
+	if persistedLog.FirstIndex != 4 {
+		t.Errorf(
+			"expected retained log to start at index 4, got %d",
+			persistedLog.FirstIndex,
+		)
+	}
+
+	// Failed installation must not publish the new metadata in memory.
+	node.mu.RLock()
+	defer node.mu.RUnlock()
+
+	if node.snapshotIndex != 0 {
+		t.Errorf(
+			"expected in-memory snapshot index 0, got %d",
+			node.snapshotIndex,
+		)
+	}
+
+	if len(node.log) != 5 {
+		t.Errorf(
+			"expected original 5 in-memory entries, got %d",
+			len(node.log),
+		)
 	}
 }

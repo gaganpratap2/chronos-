@@ -291,3 +291,75 @@ func TestDiskStorageSnapshotOperationsAfterClose(t *testing.T) {
 		t.Fatalf("expected os.ErrClosed from save, got %v", err)
 	}
 }
+
+func TestDiskStorageSaveSnapshotRecoversIncompleteTailBeforeAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hard-state.log")
+
+	storage, err := NewDiskStorage(path)
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+
+	first := Snapshot{
+		LastIncludedIndex: 5,
+		LastIncludedTerm:  2,
+		Data:              []byte("first"),
+	}
+
+	if err := storage.SaveSnapshot(first); err != nil {
+		t.Fatalf("save first snapshot: %v", err)
+	}
+
+	if err := storage.Close(); err != nil {
+		t.Fatalf("close storage: %v", err)
+	}
+
+	file, err := os.OpenFile(
+		path+".snapshots",
+		os.O_APPEND|os.O_WRONLY,
+		0600,
+	)
+	if err != nil {
+		t.Fatalf("open snapshot journal: %v", err)
+	}
+
+	_, writeErr := file.WriteString(
+		`{"LastIncludedIndex":8,"LastIncludedTerm":3`,
+	)
+	closeErr := file.Close()
+
+	if writeErr != nil {
+		t.Fatalf("write incomplete snapshot: %v", writeErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close snapshot journal: %v", closeErr)
+	}
+
+	reopened, err := NewDiskStorage(path)
+	if err != nil {
+		t.Fatalf("reopen storage: %v", err)
+	}
+	defer reopened.Close()
+
+	// Intentionally do not call LoadSnapshot before saving.
+	second := Snapshot{
+		LastIncludedIndex: 8,
+		LastIncludedTerm:  3,
+		Data:              []byte("second"),
+	}
+
+	if err := reopened.SaveSnapshot(second); err != nil {
+		t.Fatalf("save snapshot after incomplete tail: %v", err)
+	}
+
+	got, err := reopened.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("load snapshot after recovery: %v", err)
+	}
+
+	if got.LastIncludedIndex != second.LastIncludedIndex ||
+		got.LastIncludedTerm != second.LastIncludedTerm ||
+		string(got.Data) != string(second.Data) {
+		t.Fatalf("expected %+v, got %+v", second, got)
+	}
+}

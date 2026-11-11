@@ -21,8 +21,6 @@ var (
 
 // CreateSnapshot exports the state machine state, persists it,
 // and compacts the log entries covered by the snapshot.
-//
-// The snapshot is persisted before any log entries are removed.
 func (n *Node) CreateSnapshot() error {
 	// Serialize snapshot creation with state-machine application.
 	n.applyMu.Lock()
@@ -81,16 +79,28 @@ func (n *Node) CreateSnapshot() error {
 		return err
 	}
 
-	// Critical ordering: persist before compacting the log.
-	if err := storage.SaveSnapshot(snapshot); err != nil {
-		return fmt.Errorf("persist snapshot: %w", err)
+	if snapshotIndex == ^uint64(0) {
+		return ErrInvalidSnapshotIndex
 	}
 
-	// Compact only after persistence succeeds.
+	// Keep the node log stable while persisting the snapshot and
+	// its corresponding retained log.
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// Keep all entries after the snapshot index.
+	if snapshotIndex <= n.snapshotIndex ||
+		snapshotIndex > n.lastApplied {
+		return ErrInvalidSnapshotIndex
+	}
+
+	currentTerm, exists := n.termAt(snapshotIndex)
+	if !exists || currentTerm != snapshotTerm {
+		return fmt.Errorf(
+			"%w: snapshot boundary changed during creation",
+			ErrInvalidSnapshot,
+		)
+	}
+
 	offset := snapshotIndex - n.snapshotIndex
 
 	if offset > uint64(len(n.log)) {
@@ -101,13 +111,90 @@ func (n *Node) CreateSnapshot() error {
 		)
 	}
 
-	n.log = append([]LogEntry(nil), n.log[offset:]...)
+	retainedLog := append(
+		[]LogEntry(nil),
+		n.log[offset:]...,
+	)
 
+	if uint64(len(retainedLog)) > ^uint64(0)-snapshotIndex {
+		return ErrInvalidSnapshot
+	}
+
+	previousSnapshot := cloneSnapshot(n.snapshot)
+
+	// Capture the previous persisted log before modifying either
+	// durable record. This gives rollback an exact prior state.
+	logStorage, hasLogStorage := n.storage.(LogStorage)
+
+	var previousLog LogState
+
+	if hasLogStorage {
+		previousLog, err = logStorage.LoadLog()
+		if err != nil {
+			return fmt.Errorf(
+				"load previous log before snapshot creation: %w",
+				err,
+			)
+		}
+
+		if err := validateLogState(previousLog); err != nil {
+			return err
+		}
+	}
+
+	// First persist the snapshot. Recovery can reconcile an old
+	// log with this newer snapshot if the process crashes afterward.
+	if err := storage.SaveSnapshot(snapshot); err != nil {
+		return fmt.Errorf("persist snapshot: %w", err)
+	}
+
+	// Persist the compacted log before publishing in-memory state.
+	if hasLogStorage {
+		logState := LogState{
+			FirstIndex: snapshotIndex + 1,
+			Entries:    retainedLog,
+		}
+
+		if err := logStorage.SaveLog(logState); err != nil {
+			logErr := fmt.Errorf(
+				"persist compacted log: %w",
+				err,
+			)
+
+			// Restore the old log first. Never restore the old
+			// snapshot if the old log could not be recovered.
+			if rollbackErr := logStorage.SaveLog(previousLog); rollbackErr != nil {
+				return errors.Join(
+					logErr,
+					fmt.Errorf(
+						"rollback persisted log: %w",
+						rollbackErr,
+					),
+				)
+			}
+
+			// The old log is safe again, so restoring the old
+			// snapshot cannot create a snapshot/log gap.
+			if rollbackErr := storage.SaveSnapshot(previousSnapshot); rollbackErr != nil {
+				return errors.Join(
+					logErr,
+					fmt.Errorf(
+						"rollback persisted snapshot: %w",
+						rollbackErr,
+					),
+				)
+			}
+
+			return logErr
+		}
+	}
+
+	// Both persistence operations succeeded. Publish the new state.
+	n.log = retainedLog
 	n.snapshot = cloneSnapshot(snapshot)
 	n.snapshotIndex = snapshot.LastIncludedIndex
 	n.snapshotTerm = snapshot.LastIncludedTerm
 
-	// Recalculate the absolute last-log metadata.
 	n.lastLogIndex = n.lastLogIndexLocked()
 
 	if len(n.log) > 0 {
