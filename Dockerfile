@@ -1,49 +1,51 @@
 
-# ------------------------------------------
+# ==========================================
 # Stage 1: Build Chronos
-# ------------------------------------------
+# ==========================================
 FROM golang:1.27.2-bookworm AS builder
 
-WORKDIR /src
+WORKDIR /app
 
-# Copy dependency definitions first.
-# Docker can reuse this layer when source code changes
-# but dependencies remain the same.
+# Copy dependency manifests first.
+# Docker can cache dependency downloads.
 COPY go.mod go.sum ./
 
 RUN go mod download
 
-# Copy application source code.
+# Copy the application source.
 COPY . .
 
-# Compile a Linux executable without CGO dependencies.
-RUN CGO_ENABLED=0 GOOS=linux \
+# Compile a Linux executable.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags="-s -w" \
     -o /out/chronos .
 
-# ------------------------------------------
-# Stage 2: Run Chronos
-# ------------------------------------------
+# ==========================================
+# Stage 2: Runtime
+# ==========================================
 FROM debian:bookworm-slim AS runtime
 
-# Install CA certificates and timezone database.
-# Chronos uses timezone-aware scheduling.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       ca-certificates \
-       tzdata \
-    && rm -rf /var/lib/apt/lists/*
+# Install certificates and timezone database.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tzdata && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a non-root application user.
+RUN groupadd --system --gid 10001 chronos && \
+    useradd --system --uid 10001 \
+        --gid chronos \
+        --no-create-home chronos
 
 WORKDIR /app
 
-# Copy only the compiled executable.
-COPY --from=builder --chown=10001:10001 \
-    /out/chronos /app/chronos
+# Copy only the compiled application.
+COPY --from=builder /out/chronos /app/chronos
 
-# Do not run the application as root.
+# Run without root privileges.
 USER 10001:10001
 
-# Chronos HTTP API port.
 EXPOSE 8080
 
 ENTRYPOINT ["/app/chronos"]
