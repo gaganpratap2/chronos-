@@ -108,6 +108,24 @@ func (n *Node) InstallSnapshot(
 		}
 	}
 
+	// Capture the current application state when the state machine
+	// supports snapshots, so a failed restore can be reversed.
+	var previousStateMachineData []byte
+	hasStateMachineBackup := false
+
+	if snapshotMachine, supported := n.stateMachine.(SnapshotStateMachine); supported {
+		data, err := snapshotMachine.Snapshot()
+		if err != nil {
+			return response, fmt.Errorf(
+				"capture state machine before snapshot installation: %w",
+				err,
+			)
+		}
+
+		previousStateMachineData = append([]byte(nil), data...)
+		hasStateMachineBackup = true
+	}
+
 	snapshotStorage, ok := n.storage.(SnapshotStorage)
 	if !ok {
 		return response, ErrSnapshotStorageUnavailable
@@ -146,6 +164,16 @@ func (n *Node) InstallSnapshot(
 	// can attempt to restore it.
 	logStorage, hasLogStorage := n.storage.(LogStorage)
 
+	var markerStorage SnapshotInstallMarkerStorage
+
+	if hasLogStorage {
+		var ok bool
+		markerStorage, ok = n.storage.(SnapshotInstallMarkerStorage)
+		if !ok {
+			return response, ErrSnapshotInstallMarkerUnsupported
+		}
+	}
+
 	var previousLog LogState
 
 	if hasLogStorage {
@@ -172,13 +200,11 @@ func (n *Node) InstallSnapshot(
 	rollback := func(cause error) error {
 		var rollbackErrors []error
 
-		// Restore the previous log first.
 		logRollbackSucceeded := true
 
 		if hasLogStorage {
 			if err := logStorage.SaveLog(previousLog); err != nil {
 				logRollbackSucceeded = false
-
 				rollbackErrors = append(
 					rollbackErrors,
 					fmt.Errorf("rollback persisted log: %w", err),
@@ -186,13 +212,28 @@ func (n *Node) InstallSnapshot(
 			}
 		}
 
-		// Restore the previous snapshot only when the previous
-		// log has been restored successfully.
+		snapshotRollbackSucceeded := false
+
 		if logRollbackSucceeded {
 			if err := snapshotStorage.SaveSnapshot(previousSnapshot); err != nil {
 				rollbackErrors = append(
 					rollbackErrors,
 					fmt.Errorf("rollback persisted snapshot: %w", err),
+				)
+			} else {
+				snapshotRollbackSucceeded = true
+			}
+		}
+
+		// Consume the marker only when the previous persistent state
+		// has been completely restored.
+		if logRollbackSucceeded &&
+			snapshotRollbackSucceeded &&
+			markerStorage != nil {
+			if err := markerStorage.ClearSnapshotInstallMarker(); err != nil {
+				rollbackErrors = append(
+					rollbackErrors,
+					fmt.Errorf("clear snapshot install marker after rollback: %w", err),
 				)
 			}
 		}
@@ -202,8 +243,28 @@ func (n *Node) InstallSnapshot(
 		)
 	}
 
+	if markerStorage != nil {
+		marker := SnapshotInstallMarker{
+			LastIncludedIndex: incoming.LastIncludedIndex,
+			LastIncludedTerm:  incoming.LastIncludedTerm,
+		}
+
+		if err := markerStorage.SaveSnapshotInstallMarker(marker); err != nil {
+			return response, fmt.Errorf(
+				"persist snapshot install marker: %w",
+				err,
+			)
+		}
+	}
+
 	// Persist the snapshot before changing the state machine.
 	if err := snapshotStorage.SaveSnapshot(incoming); err != nil {
+		if markerStorage != nil {
+			return response, rollback(
+				fmt.Errorf("persist incoming snapshot: %w", err),
+			)
+		}
+
 		return response, err
 	}
 
@@ -227,8 +288,38 @@ func (n *Node) InstallSnapshot(
 		if err := restorer.Restore(
 			append([]byte(nil), incoming.Data...),
 		); err != nil {
-			return response, rollback(
+			installErr := rollback(
 				fmt.Errorf("restore incoming snapshot: %w", err),
+			)
+
+			if hasStateMachineBackup {
+				if restoreErr := restorer.Restore(
+					append([]byte(nil), previousStateMachineData...),
+				); restoreErr != nil {
+					installErr = errors.Join(
+						installErr,
+						fmt.Errorf(
+							"rollback state machine: %w",
+							restoreErr,
+						),
+					)
+				}
+			}
+
+			return response, installErr
+		}
+	}
+
+	var markerCleanupErr error
+
+	if markerStorage != nil {
+		if err := markerStorage.ClearSnapshotInstallMarker(); err != nil {
+			// Installation itself is complete. Keep the marker
+			// if cleanup failed; startup can safely consume it
+			// because it matches the installed snapshot.
+			markerCleanupErr = fmt.Errorf(
+				"clear snapshot install marker after successful installation: %w",
+				err,
 			)
 		}
 	}
@@ -261,7 +352,8 @@ func (n *Node) InstallSnapshot(
 
 	response.Success = true
 
-	return response, nil
+	return response, markerCleanupErr
+
 }
 
 // validateInstalledSnapshotConfiguration checks that indexed configuration

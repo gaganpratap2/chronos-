@@ -13,13 +13,18 @@ var errSnapshotPersistenceFailed = errors.New(
 type snapshotTestStateMachine struct {
 	*testStateMachine
 
-	data     []byte
-	err      error
-	restored []byte
-	events   []string
+	data        []byte
+	err         error
+	snapshotErr error
+	restoreErr  error
+	restored    []byte
+	events      []string
 }
 
 func (s *snapshotTestStateMachine) Snapshot() ([]byte, error) {
+	if s.snapshotErr != nil {
+		return nil, s.snapshotErr
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -28,6 +33,9 @@ func (s *snapshotTestStateMachine) Snapshot() ([]byte, error) {
 }
 
 func (s *snapshotTestStateMachine) Restore(data []byte) error {
+	if s.restoreErr != nil {
+		return s.restoreErr
+	}
 	if s.err != nil {
 		return s.err
 	}

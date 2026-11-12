@@ -8,6 +8,10 @@ var (
 	ErrLogStorageUnsupported = errors.New(
 		"raft storage does not support persistent log storage",
 	)
+
+	ErrConfigurationChangeInProgress = errors.New(
+		"raft configuration change already in progress",
+	)
 )
 
 // ProposeConfiguration appends a membership-change entry to the
@@ -23,11 +27,83 @@ func (n *Node) ProposeConfiguration(
 		return 0, ErrNotLeader
 	}
 
+	// Serialize proposals with committed-entry application.
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+
 	n.mu.Lock()
 
 	if n.state != StateLeader {
 		n.mu.Unlock()
 		return 0, ErrNotLeader
+	}
+
+	lastIndex := n.lastLogIndexLocked()
+
+	if n.lastApplied > lastIndex {
+		n.mu.Unlock()
+		return 0, ErrInvalidLogState
+	}
+
+	// Reject another transition while a previous configuration
+	// entry remains unapplied.
+	// A durable indexed record means the configuration entry was
+	// already applied, even if a crash occurred before lastApplied
+	// was advanced. Do not mistake that entry for a pending change.
+	var records []ConfigurationRecord
+
+	if configurationStorage, ok := n.storage.(IndexedConfigurationStorage); ok {
+		var err error
+		records, err = configurationStorage.LoadConfigurationRecords()
+		if err != nil {
+			n.mu.Unlock()
+			return 0, err
+		}
+	}
+
+	if n.lastApplied < lastIndex {
+		for index := n.lastApplied + 1; ; index++ {
+			entry, exists := n.logEntryAt(index)
+			if !exists {
+				n.mu.Unlock()
+				return 0, ErrInvalidLogState
+			}
+
+			if entry.Type == LogEntryConfiguration {
+				recorded := false
+
+				for _, record := range records {
+					if record.Index != index {
+						continue
+					}
+
+					if entry.Configuration == nil ||
+						!equalVoterSets(
+							record.Configuration.OldVoters,
+							entry.Configuration.OldVoters,
+						) ||
+						!equalVoterSets(
+							record.Configuration.NewVoters,
+							entry.Configuration.NewVoters,
+						) {
+						n.mu.Unlock()
+						return 0, ErrConfigurationIndexConflict
+					}
+
+					recorded = true
+					break
+				}
+
+				if !recorded {
+					n.mu.Unlock()
+					return 0, ErrConfigurationChangeInProgress
+				}
+			}
+
+			if index == lastIndex {
+				break
+			}
+		}
 	}
 
 	if err := ValidateConfigurationTransition(
@@ -44,8 +120,6 @@ func (n *Node) ProposeConfiguration(
 		return 0, ErrLogStorageUnsupported
 	}
 
-	lastIndex := n.lastLogIndexLocked()
-
 	if lastIndex == ^uint64(0) ||
 		n.snapshotIndex == ^uint64(0) {
 		n.mu.Unlock()
@@ -54,8 +128,6 @@ func (n *Node) ProposeConfiguration(
 
 	index := lastIndex + 1
 
-	// Build a separate candidate log. Do not modify the live log
-	// until persistent storage confirms the write.
 	candidate := cloneLogState(LogState{
 		FirstIndex: n.snapshotIndex + 1,
 		Entries:    n.log,
@@ -69,7 +141,7 @@ func (n *Node) ProposeConfiguration(
 		Configuration: &configurationCopy,
 	})
 
-	// Persistence must succeed before publishing the new entry.
+	// Persist before publishing.
 	if err := logStorage.SaveLog(LogState{
 		FirstIndex: n.snapshotIndex + 1,
 		Entries:    candidate,
@@ -78,7 +150,6 @@ func (n *Node) ProposeConfiguration(
 		return 0, err
 	}
 
-	// Publish the durable entry in memory.
 	n.log = candidate
 	n.lastLogIndex = index
 	n.lastLogTerm = n.currentTerm
@@ -87,16 +158,18 @@ func (n *Node) ProposeConfiguration(
 		n.matchIndex = make(map[string]uint64)
 	}
 
-	// The leader already has its own durable copy.
 	n.matchIndex[n.id] = index
 
-	// A single-node cluster can commit using its own vote.
 	n.advanceCommitIndexLocked()
 
 	n.mu.Unlock()
 
-	// Apply immediately if this entry became committed.
-	if err := n.applyCommittedEntriesIfConfigured(); err != nil {
+	// applyMu is already held. Use the existing locked helper.
+	n.mu.RLock()
+	stateMachine := n.stateMachine
+	n.mu.RUnlock()
+
+	if err := n.applyCommittedEntriesLocked(stateMachine); err != nil {
 		return index, err
 	}
 

@@ -7,11 +7,13 @@ package raft
 func (n *Node) AppendEntries(
 	req AppendEntriesRequest,
 ) (AppendEntriesResponse, error) {
+	n.applyMu.Lock()
 	n.mu.Lock()
 
 	response, err := n.appendEntriesLocked(req)
 
 	n.mu.Unlock()
+	n.applyMu.Unlock()
 
 	if err != nil {
 		return response, err
@@ -124,6 +126,43 @@ func (n *Node) appendEntriesLocked(
 		if index > candidateLastIndex {
 			candidate = append(candidate, cloneLogEntry(incoming))
 		}
+	}
+
+	// The applied configuration is the base for validating the
+	// remaining unapplied configuration entries.
+	if n.lastApplied < n.snapshotIndex {
+		return response, ErrInvalidLogState
+	}
+
+	configurationChangeFound := false
+
+	for i, entry := range candidate {
+		if uint64(i) > ^uint64(0)-n.snapshotIndex-1 {
+			return response, ErrInvalidLogState
+		}
+
+		index := n.snapshotIndex + uint64(i) + 1
+		if index <= n.lastApplied {
+			continue
+		}
+
+		if entry.Type != LogEntryConfiguration {
+			continue
+		}
+
+		// Only one configuration transition may be outstanding.
+		if configurationChangeFound || entry.Configuration == nil {
+			return response, nil
+		}
+
+		if err := ValidateConfigurationTransition(
+			n.configuration,
+			*entry.Configuration,
+		); err != nil {
+			return response, nil
+		}
+
+		configurationChangeFound = true
 	}
 
 	// Persist the complete candidate before publishing it in memory.

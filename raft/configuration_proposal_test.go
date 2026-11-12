@@ -230,3 +230,182 @@ func TestProposeConfigurationDoesNotPublishOnStorageFailure(
 		t.Fatalf("persisted log length = %d, want 0", len(stored.Entries))
 	}
 }
+
+func TestProposeConfigurationRejectsSecondPendingChange(t *testing.T) {
+	node := newProposalTestLeader(
+		t,
+		NewMemoryStorage(),
+		[]string{"B", "C"},
+		2,
+	)
+
+	first := ConfigurationState{
+		OldVoters: []string{"A", "B", "C"},
+		NewVoters: []string{"A", "B", "C", "D"},
+	}
+
+	if _, err := node.ProposeConfiguration(first); err != nil {
+		t.Fatal(err)
+	}
+
+	second := ConfigurationState{
+		OldVoters: []string{"A", "B", "C"},
+		NewVoters: []string{"A", "B", "C", "D", "E"},
+	}
+
+	_, err := node.ProposeConfiguration(second)
+	if !errors.Is(err, ErrConfigurationChangeInProgress) {
+		t.Fatalf(
+			"error = %v, want ErrConfigurationChangeInProgress",
+			err,
+		)
+	}
+
+	if len(node.log) != 1 {
+		t.Fatalf("log length = %d, want 1", len(node.log))
+	}
+}
+
+func TestProposeConfigurationRejectsCommittedUnappliedChange(
+	t *testing.T,
+) {
+	node := newProposalTestLeader(
+		t,
+		NewMemoryStorage(),
+		[]string{"B", "C"},
+		2,
+	)
+
+	first := ConfigurationState{
+		OldVoters: []string{"A", "B", "C"},
+		NewVoters: []string{"A", "B", "C", "D"},
+	}
+
+	if _, err := node.ProposeConfiguration(first); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate commitment before application.
+	node.mu.Lock()
+	node.commitIndex = 1
+	node.mu.Unlock()
+
+	if node.LastApplied() != 0 {
+		t.Fatalf("lastApplied = %d, want 0", node.LastApplied())
+	}
+
+	second := ConfigurationState{
+		OldVoters: []string{"A", "B", "C"},
+		NewVoters: []string{"A", "B", "C", "D", "E"},
+	}
+
+	_, err := node.ProposeConfiguration(second)
+	if !errors.Is(err, ErrConfigurationChangeInProgress) {
+		t.Fatalf(
+			"error = %v, want ErrConfigurationChangeInProgress",
+			err,
+		)
+	}
+
+	if len(node.log) != 1 {
+		t.Fatalf("log length = %d, want 1", len(node.log))
+	}
+}
+
+func TestProposeConfigurationAllowsChangeAfterPreviousApplied(
+	t *testing.T,
+) {
+	node := newProposalTestLeader(
+		t,
+		NewMemoryStorage(),
+		nil,
+		1,
+	)
+
+	first := ConfigurationState{
+		OldVoters: []string{"A"},
+		NewVoters: []string{"A", "B"},
+	}
+
+	index, err := node.ProposeConfiguration(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if node.LastApplied() != index {
+		t.Fatalf("lastApplied = %d, want %d", node.LastApplied(), index)
+	}
+
+	// Complete the joint-to-stable transition.
+	stable := ConfigurationState{
+		OldVoters: []string{"A", "B"},
+	}
+
+	index, err = node.ProposeConfiguration(stable)
+	if err != nil {
+		t.Fatalf("propose stable configuration: %v", err)
+	}
+
+	if index != 2 {
+		t.Fatalf("second proposal index = %d, want 2", index)
+	}
+
+	if len(node.log) != 2 {
+		t.Fatalf("log length = %d, want 2", len(node.log))
+	}
+}
+
+func TestProposeConfigurationAllowsChangeAfterRecordedEntryRecovery(
+	t *testing.T,
+) {
+	storage := NewMemoryStorage()
+
+	joint := ConfigurationState{
+		OldVoters: []string{"A", "B"},
+		NewVoters: []string{"A", "C"},
+	}
+
+	if err := storage.SaveLog(LogState{
+		FirstIndex: 1,
+		Entries: []LogEntry{
+			{
+				Term:          1,
+				Type:          LogEntryConfiguration,
+				Configuration: &joint,
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a crash after configuration persistence but before
+	// lastApplied was advanced.
+	if err := storage.SaveConfigurationAt(1, joint); err != nil {
+		t.Fatal(err)
+	}
+
+	node := newProposalTestLeader(t, storage, []string{"B"}, 2)
+
+	if node.LastApplied() != 0 {
+		t.Fatalf("lastApplied = %d, want 0", node.LastApplied())
+	}
+
+	if !equalVoterSets(node.configuration.OldVoters, joint.OldVoters) ||
+		!equalVoterSets(node.configuration.NewVoters, joint.NewVoters) {
+		t.Fatalf("restored configuration = %+v, want %+v",
+			node.configuration, joint)
+	}
+
+	stable := ConfigurationState{
+		OldVoters: []string{"A", "C"},
+	}
+
+	index, err := node.ProposeConfiguration(stable)
+	if err != nil {
+		t.Fatalf("propose after recovery: %v", err)
+	}
+
+	if index != 2 {
+		t.Fatalf("proposal index = %d, want 2", index)
+	}
+}

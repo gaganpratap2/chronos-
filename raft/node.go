@@ -133,6 +133,22 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 		configuration: configuration,
 	}
 
+	var installMarker SnapshotInstallMarker
+	hasInstallMarker := false
+
+	if markerStorage, ok := storage.(SnapshotInstallMarkerStorage); ok {
+		marker, pending, err := markerStorage.LoadSnapshotInstallMarker()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"load snapshot install marker: %w",
+				err,
+			)
+		}
+
+		installMarker = marker
+		hasInstallMarker = pending
+	}
+
 	// Load snapshot metadata when the storage supports snapshots.
 	if snapshotStorage, ok := storage.(SnapshotStorage); ok {
 		snapshot, err := snapshotStorage.LoadSnapshot()
@@ -154,6 +170,7 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 
 		node.lastLogIndex = snapshot.LastIncludedIndex
 		node.lastLogTerm = snapshot.LastIncludedTerm
+
 	}
 
 	// Restore retained log entries when storage supports log persistence.
@@ -239,25 +256,31 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 			entries := cloneLogState(logState).Entries
 
 			if firstIndex <= node.snapshotIndex {
-				// The persisted log may contain entries already
-				// included in a newer, successfully persisted snapshot.
 				if node.snapshotIndex <= lastIndex {
 					offset := node.snapshotIndex - firstIndex
 
-					// The snapshot and old log must agree at their
-					// shared boundary before we retain the suffix.
 					if entries[offset].Term != node.snapshotTerm {
-						return nil, fmt.Errorf(
-							"%w: snapshot term does not match log at index %d",
-							ErrInvalidLogState,
-							node.snapshotIndex,
-						)
-					}
+						markerMatchesSnapshot := hasInstallMarker &&
+							installMarker.LastIncludedIndex == node.snapshotIndex &&
+							installMarker.LastIncludedTerm == node.snapshotTerm
 
-					entries = entries[offset+1:]
+						if !markerMatchesSnapshot {
+							return nil, fmt.Errorf(
+								"%w: snapshot term does not match log at index %d",
+								ErrInvalidLogState,
+								node.snapshotIndex,
+							)
+						}
+
+						// The marker proves this snapshot was being installed
+						// when the previous process stopped. Discard the
+						// divergent old log rather than retaining its suffix.
+						entries = nil
+					} else {
+						entries = entries[offset+1:]
+					}
 				} else {
-					// The snapshot is newer than the entire old log.
-					// All old entries are already covered.
+					// The snapshot covers the entire persisted log.
 					entries = nil
 				}
 			}
@@ -354,6 +377,16 @@ func NewNodeWithStorage(id string, peers []string, storage Storage) (*Node, erro
 			node.id,
 			node.configuration,
 		)
+	}
+
+	if hasInstallMarker {
+		markerStorage := storage.(SnapshotInstallMarkerStorage)
+		if err := markerStorage.ClearSnapshotInstallMarker(); err != nil {
+			return nil, fmt.Errorf(
+				"clear snapshot install marker: %w",
+				err,
+			)
+		}
 	}
 
 	return node, nil

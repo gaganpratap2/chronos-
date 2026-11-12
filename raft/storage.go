@@ -45,6 +45,39 @@ type LogStorage interface {
 	SaveLog(state LogState) error
 }
 
+// SnapshotInstallMarker identifies a snapshot whose installation
+// may have been interrupted before the retained log was persisted.
+type SnapshotInstallMarker struct {
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+}
+
+// SnapshotInstallMarkerStorage persists the snapshot installation
+// protocol across process restarts.
+type SnapshotInstallMarkerStorage interface {
+	LoadSnapshotInstallMarker() (SnapshotInstallMarker, bool, error)
+	SaveSnapshotInstallMarker(marker SnapshotInstallMarker) error
+	ClearSnapshotInstallMarker() error
+}
+
+var (
+	ErrInvalidSnapshotInstallMarker = errors.New(
+		"invalid raft snapshot install marker",
+	)
+	ErrSnapshotInstallMarkerUnsupported = errors.New(
+		"raft storage does not support snapshot install markers",
+	)
+)
+
+func validateSnapshotInstallMarker(marker SnapshotInstallMarker) error {
+	if marker.LastIncludedIndex == 0 ||
+		marker.LastIncludedTerm == 0 {
+		return ErrInvalidSnapshotInstallMarker
+	}
+
+	return nil
+}
+
 // ConfigurationStorage persists the active Raft voter configuration.
 type ConfigurationStorage interface {
 	LoadConfiguration() (ConfigurationState, error)
@@ -81,12 +114,14 @@ var (
 // MemoryStorage is an in-memory implementation of Storage.
 // It is useful for learning and testing, but does not survive process restarts.
 type MemoryStorage struct {
-	mu                   sync.Mutex
-	state                HardState
-	snapshot             Snapshot
-	logState             LogState
-	configuration        ConfigurationState
-	configurationRecords []ConfigurationRecord
+	mu                       sync.Mutex
+	state                    HardState
+	snapshot                 Snapshot
+	logState                 LogState
+	configuration            ConfigurationState
+	configurationRecords     []ConfigurationRecord
+	snapshotInstallMarker    SnapshotInstallMarker
+	hasSnapshotInstallMarker bool
 }
 
 // NewMemoryStorage creates an empty in-memory Raft storage.
@@ -342,6 +377,43 @@ func (s *MemoryStorage) SaveConfigurationAt(
 			Configuration: configuration.Clone(),
 		},
 	)
+
+	return nil
+}
+
+func (s *MemoryStorage) LoadSnapshotInstallMarker() (
+	SnapshotInstallMarker,
+	bool,
+	error,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.snapshotInstallMarker, s.hasSnapshotInstallMarker, nil
+}
+
+func (s *MemoryStorage) SaveSnapshotInstallMarker(
+	marker SnapshotInstallMarker,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := validateSnapshotInstallMarker(marker); err != nil {
+		return err
+	}
+
+	s.snapshotInstallMarker = marker
+	s.hasSnapshotInstallMarker = true
+
+	return nil
+}
+
+func (s *MemoryStorage) ClearSnapshotInstallMarker() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.snapshotInstallMarker = SnapshotInstallMarker{}
+	s.hasSnapshotInstallMarker = false
 
 	return nil
 }

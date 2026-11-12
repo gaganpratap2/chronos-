@@ -18,6 +18,12 @@ var (
 	)
 )
 
+type partiallyFailingSnapshotStateMachine struct {
+	data         []byte
+	failOnce     bool
+	restoreCalls int
+}
+
 type snapshotInstallTestStorage struct {
 	*MemoryStorage
 
@@ -362,7 +368,8 @@ func TestInstallSnapshotRestoreFailureDoesNotChangeSnapshotMetadata(
 	storage := NewMemoryStorage()
 	node, stateMachine := newSnapshotInstallTestNode(t, storage)
 
-	stateMachine.err = errInstallSnapshotRestore
+	// stateMachine.err = errInstallSnapshotRestore
+	stateMachine.restoreErr = errInstallSnapshotRestore
 
 	persisted, err := storage.LoadSnapshot()
 	if err != nil {
@@ -451,7 +458,8 @@ func TestInstallSnapshotDoesNotRollbackSnapshotWhenLogRollbackFails(
 	}
 
 	node, stateMachine := newSnapshotInstallTestNode(t, storage)
-	stateMachine.err = errInstallSnapshotRestore
+	// stateMachine.err = errInstallSnapshotRestore
+	stateMachine.restoreErr = errInstallSnapshotRestore
 
 	response, err := node.InstallSnapshot(InstallSnapshotRequest{
 		Term:              4,
@@ -661,6 +669,86 @@ func TestInstallSnapshotRejectsConfigurationWithoutRetainedLogEntry(
 	if saved.LastIncludedIndex != 0 {
 		t.Errorf(
 			"snapshot was persisted despite configuration conflict: index %d",
+			saved.LastIncludedIndex,
+		)
+	}
+}
+
+func (s *partiallyFailingSnapshotStateMachine) Apply(
+	uint64,
+	[]byte,
+) error {
+	return nil
+}
+
+func (s *partiallyFailingSnapshotStateMachine) Snapshot() ([]byte, error) {
+	return append([]byte(nil), s.data...), nil
+}
+
+func (s *partiallyFailingSnapshotStateMachine) Restore(data []byte) error {
+	s.restoreCalls++
+	s.data = append([]byte(nil), data...)
+
+	if s.failOnce {
+		s.failOnce = false
+		return errInstallSnapshotRestore
+	}
+
+	return nil
+}
+
+func TestInstallSnapshotRestoresStateMachineAfterPartialRestoreFailure(
+	t *testing.T,
+) {
+	storage := NewMemoryStorage()
+	node, _ := newSnapshotInstallTestNode(t, storage)
+
+	stateMachine := &partiallyFailingSnapshotStateMachine{
+		data:     []byte("original-state"),
+		failOnce: true,
+	}
+
+	if err := node.SetStateMachine(stateMachine); err != nil {
+		t.Fatalf("set state machine: %v", err)
+	}
+
+	_, err := node.InstallSnapshot(InstallSnapshotRequest{
+		Term:              4,
+		LeaderID:          "leader-A",
+		LastIncludedIndex: 3,
+		LastIncludedTerm:  2,
+		Data:              []byte("incoming-state"),
+		Configuration: ConfigurationState{
+			OldVoters: []string{"follower-A", "leader-A"},
+		},
+	})
+
+	if !errors.Is(err, errInstallSnapshotRestore) {
+		t.Fatalf("expected restore error, got %v", err)
+	}
+
+	if string(stateMachine.data) != "original-state" {
+		t.Fatalf(
+			"state machine data = %q, want original-state",
+			stateMachine.data,
+		)
+	}
+
+	if stateMachine.restoreCalls != 2 {
+		t.Fatalf(
+			"restore calls = %d, want 2",
+			stateMachine.restoreCalls,
+		)
+	}
+
+	saved, err := storage.LoadSnapshot()
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+
+	if saved.LastIncludedIndex != 0 {
+		t.Errorf(
+			"persisted snapshot index = %d, want 0",
 			saved.LastIncludedIndex,
 		)
 	}

@@ -248,3 +248,80 @@ func TestFollowerAutomaticallyAppliesCommittedEntries(t *testing.T) {
 		t.Fatalf("lastApplied = %d, want 2", node.LastApplied())
 	}
 }
+
+func TestAppendEntriesRejectsMultipleUnappliedConfigurationEntries(
+	t *testing.T,
+) {
+	node := newAppendEntriesTestNode(t)
+
+	current := node.configuration.Clone()
+	joint := ConfigurationState{
+		OldVoters: append([]string(nil), current.OldVoters...),
+		NewVoters: append(
+			append([]string(nil), current.OldVoters...),
+			"follower-2",
+		),
+	}
+	stable := ConfigurationState{
+		OldVoters: append([]string(nil), joint.NewVoters...),
+	}
+
+	response, err := node.AppendEntries(AppendEntriesRequest{
+		Term:     1,
+		LeaderID: "leader-1",
+		Entries: []LogEntry{
+			{
+				Term:          1,
+				Type:          LogEntryConfiguration,
+				Configuration: &joint,
+			},
+			{
+				Term:          1,
+				Type:          LogEntryConfiguration,
+				Configuration: &stable,
+			},
+		},
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Success {
+		t.Fatal("accepted multiple unapplied configuration entries")
+	}
+	if len(node.log) != 0 {
+		t.Fatalf("log length = %d, want 0", len(node.log))
+	}
+}
+
+func TestAppendEntriesRejectsInvalidConfigurationTransition(
+	t *testing.T,
+) {
+	node := newAppendEntriesTestNode(t)
+
+	invalid := ConfigurationState{
+		OldVoters: []string{"unrelated-node"},
+	}
+
+	response, err := node.AppendEntries(AppendEntriesRequest{
+		Term:     1,
+		LeaderID: "leader-1",
+		Entries: []LogEntry{
+			{
+				Term:          1,
+				Type:          LogEntryConfiguration,
+				Configuration: &invalid,
+			},
+		},
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Success {
+		t.Fatal("accepted an invalid configuration transition")
+	}
+	if len(node.log) != 0 {
+		t.Fatalf("log length = %d, want 0", len(node.log))
+	}
+}
