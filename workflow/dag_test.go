@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -146,5 +147,55 @@ func TestTopologicalOrderRejectsCycle(t *testing.T) {
 
 	if order != nil {
 		t.Fatalf("expected nil order for cyclic graph, got %v", order)
+	}
+}
+
+func TestTopologicalOrderIsDeterministic(t *testing.T) {
+	tasks := []Task{
+		{ID: 4},
+		{ID: 2},
+		{ID: 1},
+	}
+
+	dependencies := []Dependency{
+		{TaskID: 2, DependsOnTaskID: 1},
+	}
+
+	expected := []int64{1, 2, 4}
+
+	order, err := TopologicalOrder(tasks, dependencies)
+	if err != nil {
+		t.Fatalf("TopologicalOrder() error = %v", err)
+	}
+
+	if !reflect.DeepEqual(order, expected) {
+		t.Fatalf("TopologicalOrder() = %v, want %v", order, expected)
+	}
+
+	// Reverse the input order. The result should remain unchanged.
+	reversedTasks := []Task{
+		{ID: 1},
+		{ID: 2},
+		{ID: 4},
+	}
+
+	reversedDependencies := []Dependency{
+		{TaskID: 2, DependsOnTaskID: 1},
+	}
+
+	reversedOrder, err := TopologicalOrder(
+		reversedTasks,
+		reversedDependencies,
+	)
+	if err != nil {
+		t.Fatalf("TopologicalOrder() with reversed input error = %v", err)
+	}
+
+	if !reflect.DeepEqual(reversedOrder, expected) {
+		t.Fatalf(
+			"TopologicalOrder() with reversed input = %v, want %v",
+			reversedOrder,
+			expected,
+		)
 	}
 }

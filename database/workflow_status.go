@@ -49,6 +49,7 @@ func UpdateWorkflowStatus(
 		failedTasks    int
 		blockedTasks   int
 		runningTasks   int
+		readyTasks     int
 	)
 
 	err = pool.QueryRow(
@@ -59,7 +60,8 @@ func UpdateWorkflowStatus(
 			COUNT(*) FILTER (WHERE status = 'Completed'),
 			COUNT(*) FILTER (WHERE status = 'Failed'),
 			COUNT(*) FILTER (WHERE status = 'Blocked'),
-			COUNT(*) FILTER (WHERE status = 'Running')
+			COUNT(*) FILTER (WHERE status = 'Running'),
+			COUNT(*) FILTER (WHERE status = 'Ready')
 		FROM workflow_tasks
 		WHERE workflow_id = $1
 		`,
@@ -70,6 +72,7 @@ func UpdateWorkflowStatus(
 		&failedTasks,
 		&blockedTasks,
 		&runningTasks,
+		&readyTasks,
 	)
 
 	if err != nil {
@@ -89,10 +92,11 @@ func UpdateWorkflowStatus(
 	case totalTasks > 0 && completedTasks == totalTasks:
 		nextStatus = "Completed"
 
-	case runningTasks > 0 || completedTasks > 0:
+	case readyTasks > 0 || runningTasks > 0 || completedTasks > 0:
 		nextStatus = "Running"
 
 	default:
+
 		nextStatus = "Pending"
 	}
 

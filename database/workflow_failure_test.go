@@ -139,4 +139,37 @@ func TestPropagateBlockedTasks(t *testing.T) {
 			status,
 		)
 	}
+
+	// Update the parent workflow after failure propagation.
+	if err := UpdateWorkflowStatus(
+		ctx,
+		pool,
+		workflowID,
+	); err != nil {
+		t.Fatalf("update workflow status: %v", err)
+	}
+
+	var workflowStatus string
+
+	err = pool.QueryRow(
+		ctx,
+		`
+        SELECT status
+        FROM workflows
+        WHERE id = $1
+        `,
+		workflowID,
+	).Scan(&workflowStatus)
+
+	if err != nil {
+		t.Fatalf("read workflow status: %v", err)
+	}
+
+	if workflowStatus != "Failed" {
+		t.Fatalf(
+			"expected workflow to be Failed, got %s",
+			workflowStatus,
+		)
+	}
+
 }

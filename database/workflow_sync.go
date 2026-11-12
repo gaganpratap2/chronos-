@@ -219,3 +219,33 @@ func ReconcileWorkflow(
 
 	return nil
 }
+
+// ReconcileWorkflowForJob reconciles the workflow associated with a job.
+// Standalone jobs are intentionally ignored.
+func ReconcileWorkflowForJob(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	jobID int64,
+) error {
+	var workflowID int64
+
+	err := pool.QueryRow(
+		ctx,
+		`SELECT workflow_id FROM workflow_tasks WHERE job_id = $1`,
+		jobID,
+	).Scan(&workflowID)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf(
+			"find workflow for job %d: %w",
+			jobID,
+			err,
+		)
+	}
+
+	return ReconcileWorkflow(ctx, pool, workflowID)
+}

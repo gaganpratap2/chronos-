@@ -148,6 +148,8 @@ func ValidateWorkflowDefinition(definition WorkflowDefinition) error {
 		taskIDs[task.ID] = task
 	}
 
+	dependencyPairs := make(map[[2]int64]struct{})
+
 	for _, dependency := range definition.Dependencies {
 		if _, exists := taskIDs[dependency.TaskID]; !exists {
 			return fmt.Errorf(
@@ -166,6 +168,21 @@ func ValidateWorkflowDefinition(definition WorkflowDefinition) error {
 		if dependency.TaskID == dependency.DependsOnTaskID {
 			return workflow.ErrSelfDependency
 		}
+
+		pair := [2]int64{
+			dependency.TaskID,
+			dependency.DependsOnTaskID,
+		}
+
+		if _, exists := dependencyPairs[pair]; exists {
+			return fmt.Errorf(
+				"duplicate dependency %d -> %d",
+				dependency.DependsOnTaskID,
+				dependency.TaskID,
+			)
+		}
+
+		dependencyPairs[pair] = struct{}{}
 	}
 
 	if workflow.HasCycle(

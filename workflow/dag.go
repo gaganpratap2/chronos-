@@ -1,6 +1,9 @@
 package workflow
 
-import "errors"
+import (
+	"container/heap"
+	"errors"
+)
 
 var ErrCycleDetected = errors.New("workflow contains a cycle")
 
@@ -63,27 +66,26 @@ func TopologicalOrder(tasks []Task, dependencies []Dependency) ([]int64, error) 
 		inDegree[dependency.TaskID]++
 	}
 
-	queue := make([]int64, 0)
+	queue := &taskIDHeap{}
+	heap.Init(queue)
 
 	for _, task := range tasks {
 		if inDegree[task.ID] == 0 {
-			queue = append(queue, task.ID)
+			heap.Push(queue, task.ID)
 		}
 	}
 
 	order := make([]int64, 0, len(tasks))
 
-	for len(queue) > 0 {
-		taskID := queue[0]
-		queue = queue[1:]
-
+	for queue.Len() > 0 {
+		taskID := heap.Pop(queue).(int64)
 		order = append(order, taskID)
 
 		for _, dependentTaskID := range graph[taskID] {
 			inDegree[dependentTaskID]--
 
 			if inDegree[dependentTaskID] == 0 {
-				queue = append(queue, dependentTaskID)
+				heap.Push(queue, dependentTaskID)
 			}
 		}
 	}
@@ -93,4 +95,30 @@ func TopologicalOrder(tasks []Task, dependencies []Dependency) ([]int64, error) 
 	}
 
 	return order, nil
+}
+
+type taskIDHeap []int64
+
+func (h taskIDHeap) Len() int {
+	return len(h)
+}
+
+func (h taskIDHeap) Less(i, j int) bool {
+	return h[i] < h[j]
+}
+
+func (h taskIDHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *taskIDHeap) Push(value interface{}) {
+	*h = append(*h, value.(int64))
+}
+
+func (h *taskIDHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	value := old[n-1]
+	*h = old[:n-1]
+	return value
 }

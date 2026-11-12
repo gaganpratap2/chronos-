@@ -210,6 +210,17 @@ func (w *Worker) runOnce(
 		// A confirmed provider failure is terminal.
 		// Do not schedule another retry for this logical operation.
 		if errors.Is(executionErr, execution.ErrOperationFailed) {
+			if err := database.ReconcileWorkflowForJob(
+				ctx,
+				w.Pool,
+				int64(j.ID),
+			); err != nil {
+				return true, fmt.Errorf(
+					"reconcile workflow after terminal job failure: %w",
+					err,
+				)
+			}
+
 			return true, nil
 		}
 
@@ -221,8 +232,21 @@ func (w *Worker) runOnce(
 			w.RetryPolicy,
 			j.FencingToken,
 		)
+
 		if retryErr != nil {
 			if errors.Is(retryErr, job.ErrRetriesExhausted) {
+				if err := database.ReconcileWorkflowForJob(
+					ctx,
+					w.Pool,
+					int64(j.ID),
+				); err != nil {
+					return true, fmt.Errorf(
+						"job %d exhausted retries; workflow reconciliation failed: %w",
+						j.ID,
+						err,
+					)
+				}
+
 				return true, fmt.Errorf(
 					"job %d failed and has exhausted retries: %w",
 					j.ID,
@@ -252,6 +276,18 @@ func (w *Worker) runOnce(
 	if err != nil {
 		return true, fmt.Errorf(
 			"mark job %d completed: %w",
+			j.ID,
+			err,
+		)
+	}
+
+	if err := database.ReconcileWorkflowForJob(
+		ctx,
+		w.Pool,
+		int64(j.ID),
+	); err != nil {
+		return true, fmt.Errorf(
+			"job %d completed but workflow reconciliation failed: %w",
 			j.ID,
 			err,
 		)

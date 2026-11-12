@@ -535,3 +535,45 @@ func TestCreateWorkflowRejectsCycleBeforePersistence(t *testing.T) {
 		)
 	}
 }
+
+func TestValidateWorkflowDefinitionRejectsDuplicateDependencies(t *testing.T) {
+	w, err := workflow.NewWorkflow(
+		14001,
+		"duplicate-dependency-workflow",
+	)
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+
+	taskA, err := workflow.NewTask(14002, w.ID, "task-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	taskB, err := workflow.NewTask(14003, w.ID, "task-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	definition := WorkflowDefinition{
+		Workflow: w,
+		Tasks: []workflow.Task{
+			taskA,
+			taskB,
+		},
+		Dependencies: []workflow.Dependency{
+			{
+				TaskID:          taskB.ID,
+				DependsOnTaskID: taskA.ID,
+			},
+			{
+				TaskID:          taskB.ID,
+				DependsOnTaskID: taskA.ID,
+			},
+		},
+	}
+
+	if err := ValidateWorkflowDefinition(definition); err == nil {
+		t.Fatal("expected duplicate dependency to be rejected")
+	}
+}

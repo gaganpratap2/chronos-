@@ -44,9 +44,9 @@ func TestUpdateWorkflowStatus(t *testing.T) {
 	_, err = pool.Exec(
 		ctx,
 		`
-		INSERT INTO workflows (id, name, status)
-		VALUES ($1, $2, 'Pending')
-		`,
+			INSERT INTO workflows (id, name, status)
+			VALUES ($1, $2, 'Pending')
+			`,
 		workflowID,
 		"workflow-status-test",
 	)
@@ -57,20 +57,69 @@ func TestUpdateWorkflowStatus(t *testing.T) {
 	_, err = pool.Exec(
 		ctx,
 		`
-		INSERT INTO workflow_tasks (
-			id,
-			workflow_id,
-			name,
-			status
-		)
-		VALUES
-			(999602, $1, 'task-a', 'Completed'),
-			(999603, $1, 'task-b', 'Completed')
-		`,
+			INSERT INTO workflow_tasks (
+				id,
+				workflow_id,
+				name,
+				status
+			)
+			VALUES
+				(999602, $1, 'task-a', 'Completed'),
+				(999603, $1, 'task-b', 'Completed')
+			`,
 		workflowID,
 	)
 	if err != nil {
 		t.Fatalf("create tasks: %v", err)
+	}
+
+	// Dispatched tasks must make the workflow Running.
+	_, err = pool.Exec(
+		ctx,
+		`
+					UPDATE workflow_tasks
+					SET status = 'Ready'
+					WHERE workflow_id = $1
+					`,
+		workflowID,
+	)
+	if err != nil {
+		t.Fatalf("set tasks ready: %v", err)
+	}
+
+	if err := UpdateWorkflowStatus(ctx, pool, workflowID); err != nil {
+		t.Fatalf("update ready workflow: %v", err)
+	}
+
+	var readyWorkflowStatus string
+	err = pool.QueryRow(
+		ctx,
+		`SELECT status FROM workflows WHERE id = $1`,
+		workflowID,
+	).Scan(&readyWorkflowStatus)
+	if err != nil {
+		t.Fatalf("read ready workflow: %v", err)
+	}
+
+	if readyWorkflowStatus != "Running" {
+		t.Fatalf(
+			"expected Running for Ready tasks, got %q",
+			readyWorkflowStatus,
+		)
+	}
+
+	// Restore completed tasks for the existing assertions.
+	_, err = pool.Exec(
+		ctx,
+		`
+					UPDATE workflow_tasks
+					SET status = 'Completed'
+					WHERE workflow_id = $1
+					`,
+		workflowID,
+	)
+	if err != nil {
+		t.Fatalf("restore completed tasks: %v", err)
 	}
 
 	err = UpdateWorkflowStatus(
@@ -87,10 +136,10 @@ func TestUpdateWorkflowStatus(t *testing.T) {
 	err = pool.QueryRow(
 		ctx,
 		`
-		SELECT status
-		FROM workflows
-		WHERE id = $1
-		`,
+			SELECT status
+			FROM workflows
+			WHERE id = $1
+			`,
 		workflowID,
 	).Scan(&status)
 	if err != nil {
@@ -107,10 +156,10 @@ func TestUpdateWorkflowStatus(t *testing.T) {
 	_, err = pool.Exec(
 		ctx,
 		`
-		UPDATE workflow_tasks
-		SET status = 'Running'
-		WHERE id = 999603
-		`,
+			UPDATE workflow_tasks
+			SET status = 'Running'
+			WHERE id = 999603
+			`,
 	)
 	if err != nil {
 		t.Fatalf("update task: %v", err)
@@ -128,10 +177,10 @@ func TestUpdateWorkflowStatus(t *testing.T) {
 	err = pool.QueryRow(
 		ctx,
 		`
-		SELECT status
-		FROM workflows
-		WHERE id = $1
-		`,
+			SELECT status
+			FROM workflows
+			WHERE id = $1
+			`,
 		workflowID,
 	).Scan(&status)
 	if err != nil {
@@ -148,10 +197,10 @@ func TestUpdateWorkflowStatus(t *testing.T) {
 	_, err = pool.Exec(
 		ctx,
 		`
-		UPDATE workflow_tasks
-		SET status = 'Failed'
-		WHERE id = 999603
-		`,
+			UPDATE workflow_tasks
+			SET status = 'Failed'
+			WHERE id = 999603
+			`,
 	)
 	if err != nil {
 		t.Fatalf("fail task: %v", err)
@@ -169,10 +218,10 @@ func TestUpdateWorkflowStatus(t *testing.T) {
 	err = pool.QueryRow(
 		ctx,
 		`
-		SELECT status
-		FROM workflows
-		WHERE id = $1
-		`,
+			SELECT status
+			FROM workflows
+			WHERE id = $1
+			`,
 		workflowID,
 	).Scan(&status)
 	if err != nil {

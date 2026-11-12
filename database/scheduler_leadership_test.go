@@ -56,8 +56,10 @@ func TestSchedulerLeadershipLifecycle(t *testing.T) {
 			context.Background(),
 			`
 			UPDATE scheduler_leadership
-			SET instance_id = NULL, lease_until = NULL
-			WHERE instance_id = ANY($1)
+SET lease_until = clock_timestamp() - INTERVAL '1 second'
+WHERE singleton_id = 1
+  AND instance_id = $1
+  AND fencing_token = $2
 			`,
 			[]string{instanceA, instanceB},
 		)
@@ -126,11 +128,16 @@ func TestSchedulerLeadershipLifecycle(t *testing.T) {
 	_, err = pool.Exec(
 		ctx,
 		`
-		UPDATE scheduler_leadership
-		SET lease_until = NOW() - INTERVAL '1 second'
-		WHERE singleton_id = 1
-		`,
+        UPDATE scheduler_leadership
+        SET lease_until = clock_timestamp() - INTERVAL '1 second'
+        WHERE singleton_id = 1
+          AND instance_id = $1
+          AND fencing_token = $2
+        `,
+		instanceA,
+		leadershipA.FencingToken,
 	)
+
 	if err != nil {
 		t.Fatalf("expire leadership lease: %v", err)
 	}
