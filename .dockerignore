@@ -1,0 +1,28 @@
+
+# Git history
+.git
+.gitignore
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Go build outputs
+chronos
+chronos.exe
+*.test
+*.out
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation and temporary files
+*.log
+tmp/
+temp/
