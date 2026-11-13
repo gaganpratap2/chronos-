@@ -2,12 +2,14 @@ package main
 
 import (
 	"chronos/execution"
+	"chronos/observability"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	// "log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -124,7 +126,10 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		// Step 4: Calculate the request fingerprint.
 		requestHash, err := hashCreateJobRequest(request)
 		if err != nil {
-			log.Printf("Failed to hash job request: %v", err)
+			slog.Error(
+				"failed to hash job request",
+				"error", err,
+			)
 
 			http.Error(
 				w,
@@ -138,7 +143,11 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		// starting the database transaction.
 		responseBody, err := json.Marshal(newJob)
 		if err != nil {
-			log.Printf("Failed to encode job response: %v", err)
+			slog.Error(
+				"failed to encode job response",
+				"job_id", newJob.ID,
+				"error", err,
+			)
 
 			http.Error(
 				w,
@@ -182,9 +191,10 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 					[]byte(`{"status":"processing"}`),
 				)
 				if writeErr != nil {
-					log.Printf(
-						"Failed to write in-progress response: %v",
-						writeErr,
+					slog.Warn(
+						"failed to write in-progress response",
+						"job_id", newJob.ID,
+						"error", writeErr,
 					)
 				}
 				return
@@ -214,10 +224,10 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 
 			// Fail closed if the database cannot verify or
 			// complete the idempotent operation.
-			log.Printf(
-				"Failed to create job %d idempotently: %v",
-				newJob.ID,
-				err,
+			slog.Error(
+				"failed to create job idempotently",
+				"job_id", newJob.ID,
+				"error", err,
 			)
 
 			http.Error(
@@ -238,9 +248,10 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		w.WriteHeader(result.HTTPStatus)
 
 		if _, err := w.Write(result.Body); err != nil {
-			log.Printf(
-				"Failed to write job response: %v",
-				err,
+			slog.Warn(
+				"failed to write job response",
+				"job_id", newJob.ID,
+				"error", err,
 			)
 		}
 	}
@@ -266,14 +277,22 @@ func getJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				return
 			}
 
-			log.Printf("Failed to retrieve job %d: %v", id, err)
+			slog.Error(
+				"failed to retrieve job",
+				"job_id", id,
+				"error", err,
+			)
 			http.Error(w, "failed to retrieve job", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(savedJob); err != nil {
-			log.Printf("Response encoding error: %v", err)
+			slog.Warn(
+				"failed to encode job response",
+				"job_id", id,
+				"error", err,
+			)
 		}
 	}
 }
@@ -324,14 +343,23 @@ func transitionJobStatusHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				return
 			}
 
-			log.Printf("Failed to transition job %d: %v", id, err)
+			slog.Error(
+				"failed to transition job status",
+				"job_id", id,
+				"requested_status", request.Status,
+				"error", err,
+			)
 			http.Error(w, "failed to transition job", http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(updatedJob); err != nil {
-			log.Printf("Response encoding error: %v", err)
+			slog.Warn(
+				"failed to encode updated job response",
+				"job_id", id,
+				"error", err,
+			)
 		}
 	}
 }
@@ -355,7 +383,11 @@ func (h AppHandler) Execute(
 	j job.Job,
 ) error {
 	// Standalone jobs retain their existing execution path.
-	log.Printf("Executing standalone job %d: %s", j.ID, j.Name)
+	slog.Info(
+		"executing standalone job",
+		"job_id", j.ID,
+		"job_name", j.Name,
+	)
 	return nil
 }
 
@@ -414,11 +446,11 @@ func (h AppHandler) ExecuteWithOperations(
 		)
 	}
 
-	log.Printf(
-		"Workflow task %d operation completed: provider_reference=%s replayed=%t",
-		execContext.WorkflowTaskID,
-		result.ProviderReference,
-		result.Replayed,
+	slog.Info(
+		"workflow task operation completed",
+		"workflow_task_id", execContext.WorkflowTaskID,
+		"provider_reference", result.ProviderReference,
+		"replayed", result.Replayed,
 	)
 
 	return nil
@@ -428,8 +460,29 @@ var _ worker.OperationAwareHandler = AppHandler{}
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println(".env not found; using system environment variables")
+		if err := godotenv.Load(); err != nil {
+			slog.Info(
+				"dotenv file not loaded; using system environment variables",
+				"error", err,
+			)
+		}
 	}
+
+	level, err := observability.ParseLevel(
+		os.Getenv("CHRONOS_LOG_LEVEL"),
+	)
+	if err != nil {
+		slog.Error("configure logger", "error", err)
+		os.Exit(1)
+	}
+
+	logger := observability.NewJSONLogger(os.Stdout, level)
+	slog.SetDefault(logger)
+
+	slog.Info(
+		"structured logger initialized",
+		"log_level", level.String(),
+	)
 
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
@@ -439,7 +492,8 @@ func main() {
 
 	pool, err := database.Connect(ctx)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("database connection failed", "error", err)
+		os.Exit(1)
 	}
 	defer pool.Close()
 
@@ -447,12 +501,14 @@ func main() {
 
 	hostname, err := os.Hostname()
 	if err != nil {
-		log.Fatalf("failed to get hostname: %v", err)
+		slog.Error("failed to get hostname", "error", err)
+		os.Exit(1)
 	}
 
 	developmentProvider, err := execution.NewDevelopmentProvider(pool)
 	if err != nil {
-		log.Fatalf("create development provider: %v", err)
+		slog.Error("failed to create development provider", "error", err)
+		os.Exit(1)
 	}
 
 	operationService, err := execution.NewOperationService(
@@ -462,11 +518,16 @@ func main() {
 		},
 	)
 	if err != nil {
-		log.Fatalf("create operation service: %v", err)
+		slog.Error("failed to create operation service", "error", err)
+		os.Exit(1)
 	}
 
 	workerID := fmt.Sprintf("%s-%d", hostname, os.Getpid())
-	log.Printf("Starting worker with ID: %s", workerID)
+	slog.Info(
+		"worker started",
+		"worker_id", workerID,
+		"poll_interval", 500*time.Millisecond,
+	)
 
 	recoveryWorkerID := fmt.Sprintf(
 		"%s-recovery-%d",
@@ -484,12 +545,14 @@ func main() {
 		execution.MaxRecoveryAttempts,
 	)
 	if err != nil {
-		log.Fatalf("create recovery processor: %v", err)
+		slog.Error("failed to create recovery processor", "error", err)
+		os.Exit(1)
 	}
 
-	log.Printf(
-		"Starting recovery processor with ID: %s",
-		recoveryWorkerID,
+	slog.Info(
+		"recovery processor started",
+		"worker_id", recoveryWorkerID,
+		"poll_interval", 5*time.Second,
 	)
 
 	w := &worker.Worker{
@@ -509,7 +572,11 @@ func main() {
 
 	go func() {
 		if err := w.Run(workerCtx); err != nil {
-			log.Printf("Worker stopped: %v", err)
+			slog.Error(
+				"worker stopped unexpectedly",
+				"worker_id", workerID,
+				"error", err,
+			)
 		}
 	}()
 
@@ -518,7 +585,11 @@ func main() {
 			workerCtx,
 			5*time.Second,
 		); err != nil {
-			log.Printf("Recovery processor stopped: %v", err)
+			slog.Error(
+				"recovery processor stopped unexpectedly",
+				"worker_id", recoveryWorkerID,
+				"error", err,
+			)
 		}
 	}()
 
@@ -544,7 +615,10 @@ func main() {
 		rescheduleCronHandler(pool),
 	)
 
-	fmt.Println("Chronos API listening on http://localhost:8080")
+	slog.Info(
+		"HTTP server starting",
+		"address", ":8080",
+	)
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -554,7 +628,10 @@ func main() {
 	go func() {
 		if err := server.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
-			log.Printf("HTTP server error: %v", err)
+			slog.Error(
+				"HTTP server failed",
+				"error", err,
+			)
 			workerCancel()
 		}
 	}()
@@ -568,6 +645,9 @@ func main() {
 	defer shutdownCancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+		slog.Error(
+			"HTTP server shutdown failed",
+			"error", err,
+		)
 	}
 }

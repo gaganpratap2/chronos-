@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -267,28 +267,28 @@ func (p *RecoveryProcessor) Run(
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
-	log.Printf(
-		"Recovery processor %s started with poll interval %s",
-		p.workerID,
-		pollInterval,
+	slog.Info(
+		"recovery processor started",
+		"worker_id", p.workerID,
+		"poll_interval", pollInterval,
 	)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf(
-				"Recovery processor %s stopped",
-				p.workerID,
+			slog.Info(
+				"recovery processor stopped",
+				"worker_id", p.workerID,
 			)
 			return nil
 
 		case <-ticker.C:
 			_, err := p.RunOnce(ctx)
 			if err != nil {
-				log.Printf(
-					"Recovery processor %s failed to process an operation: %v",
-					p.workerID,
-					err,
+				slog.Error(
+					"recovery operation processing failed",
+					"worker_id", p.workerID,
+					"error", err,
 				)
 			}
 		}

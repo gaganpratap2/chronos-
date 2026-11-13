@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -47,7 +47,11 @@ func writeRecurringScheduleError(
 		return
 	}
 
-	log.Printf("Failed to %s recurring schedule: %v", action, err)
+	slog.Error(
+		"recurring schedule operation failed",
+		"action", action,
+		"error", err,
+	)
 	http.Error(
 		w,
 		"failed to "+action+" recurring schedule",
@@ -71,7 +75,10 @@ func writeRecurringSchedule(
 	w.Header().Set("Content-Type", "application/json")
 
 	if err := json.NewEncoder(w).Encode(updated); err != nil {
-		log.Printf("Recurring schedule response encoding error: %v", err)
+		slog.Error(
+			"recurring schedule response encoding failed",
+			"error", err,
+		)
 	}
 }
 
