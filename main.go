@@ -63,6 +63,34 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, `{"status":"ok"}`)
 }
 
+func readinessHandler(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if pool == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintln(w, `{"status":"not_ready","reason":"database unavailable"}`)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := pool.Ping(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprintln(w, `{"status":"not_ready","reason":"database unavailable"}`)
+			return
+		}
+
+		fmt.Fprintln(w, `{"status":"ready"}`)
+	}
+}
+
 func createJobHandler(pool *pgxpool.Pool, metrics *observability.Metrics) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -620,6 +648,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/ready", readinessHandler(pool))
 	mux.HandleFunc("/jobs", createJobHandler(pool, metrics))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
 	mux.HandleFunc(

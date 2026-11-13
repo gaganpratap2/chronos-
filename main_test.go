@@ -397,13 +397,13 @@ func TestTransitionJobAPI(t *testing.T) {
 	}()
 
 	registry := prometheus.NewRegistry()
-metrics, err := observability.NewMetrics(registry)
-if err != nil {
-    t.Fatalf("failed to initialize metrics: %v", err)
-}
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("failed to initialize metrics: %v", err)
+	}
 
-mux := http.NewServeMux()
-mux.HandleFunc("/jobs", createJobHandler(pool, metrics))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/jobs", createJobHandler(pool, metrics))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
 	mux.HandleFunc(
 		"PATCH /jobs/{id}/status",
@@ -569,3 +569,33 @@ mux.HandleFunc("/jobs", createJobHandler(pool, metrics))
 // 		t.Errorf("duplicate request: expected 409, got %d", status)
 // 	}
 // }
+
+func TestReadinessHandlerRejectsNonGetMethod(t *testing.T) {
+	handler := readinessHandler(nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/ready", nil)
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected status 405, got %d", rec.Code)
+	}
+}
+
+func TestReadinessHandlerRejectsNilPool(t *testing.T) {
+	handler := readinessHandler(nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	rec := httptest.NewRecorder()
+
+	handler(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d", rec.Code)
+	}
+
+	if !strings.Contains(rec.Body.String(), `"status":"not_ready"`) {
+		t.Errorf("unexpected readiness response: %s", rec.Body.String())
+	}
+}

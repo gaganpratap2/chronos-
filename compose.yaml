@@ -15,9 +15,10 @@ services:
       - ./database/migrations:/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U chronos -d chronos"]
-      interval: 5s
+      interval: 15s
       timeout: 5s
-      retries: 10
+      start_period: 10s
+      retries: 3
     restart: unless-stopped
 
   app:
@@ -32,6 +33,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/ready"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
     restart: unless-stopped
 
   prometheus:
@@ -46,7 +53,8 @@ services:
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=15d"
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     restart: unless-stopped
 
   grafana:
@@ -62,7 +70,8 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
