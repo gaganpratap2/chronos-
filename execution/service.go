@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"chronos/observability"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -39,6 +40,7 @@ var (
 type OperationService struct {
 	pool      *pgxpool.Pool
 	providers map[string]Provider
+	metrics   *observability.Metrics
 }
 
 // operationPersistenceContext allows a short database update
@@ -52,7 +54,7 @@ func operationPersistenceContext(
 	)
 }
 
-func NewOperationService(pool *pgxpool.Pool, providers map[string]Provider) (*OperationService, error) {
+func NewOperationService(pool *pgxpool.Pool, providers map[string]Provider, metrics ...*observability.Metrics) (*OperationService, error) {
 
 	if pool == nil {
 		return nil, errors.New("database pool is required")
@@ -75,10 +77,16 @@ func NewOperationService(pool *pgxpool.Pool, providers map[string]Provider) (*Op
 		providerCopy[name] = provider
 	}
 
-	return &OperationService{
+	service := &OperationService{
 		pool:      pool,
 		providers: providerCopy,
-	}, nil
+	}
+
+	if len(metrics) > 0 {
+		service.metrics = metrics[0]
+	}
+
+	return service, nil
 
 }
 
@@ -189,11 +197,19 @@ func (s *OperationService) Execute(ctx context.Context, request OperationRequest
 		)
 	}
 
+	providerStarted := time.Now()
+
 	providerResult, providerErr := provider.Execute(
 		ctx,
 		request.IdempotencyKey,
 		request.Payload,
 	)
+
+	if s.metrics != nil {
+		s.metrics.ExternalOperationDuration.Observe(
+			time.Since(providerStarted).Seconds(),
+		)
+	}
 
 	if providerErr != nil {
 		return OperationResult{}, s.markUnknown(
@@ -398,10 +414,18 @@ func (s *OperationService) reconcileUnknownOperation(
 
 	// Ask the provider about the original operation.
 	// Never generate a new key during reconciliation.
+	providerStarted := time.Now()
+
 	providerResult, err := provider.Lookup(
 		ctx,
 		request.IdempotencyKey,
 	)
+
+	if s.metrics != nil {
+		s.metrics.ExternalOperationDuration.Observe(
+			time.Since(providerStarted).Seconds(),
+		)
+	}
 
 	if err != nil {
 		return OperationResult{}, s.markUnknown(

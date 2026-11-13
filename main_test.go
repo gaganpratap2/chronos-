@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"chronos/database"
+	"chronos/observability"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestHealthHandler(t *testing.T) {
@@ -104,8 +106,17 @@ func TestJobAPI(t *testing.T) {
 		}
 	}()
 
+	// mux := http.NewServeMux()
+	// mux.HandleFunc("/jobs", createJobHandler(pool))
+
+	registry := prometheus.NewRegistry()
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("failed to initialize metrics: %v", err)
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/jobs", createJobHandler(pool))
+	mux.HandleFunc("/jobs", createJobHandler(pool, metrics))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
 
 	// 1. Create a new job.
@@ -385,8 +396,14 @@ func TestTransitionJobAPI(t *testing.T) {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/jobs", createJobHandler(pool))
+	registry := prometheus.NewRegistry()
+metrics, err := observability.NewMetrics(registry)
+if err != nil {
+    t.Fatalf("failed to initialize metrics: %v", err)
+}
+
+mux := http.NewServeMux()
+mux.HandleFunc("/jobs", createJobHandler(pool, metrics))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
 	mux.HandleFunc(
 		"PATCH /jobs/{id}/status",

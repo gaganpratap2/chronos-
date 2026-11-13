@@ -8,9 +8,12 @@ import (
 
 	"chronos/database"
 	"chronos/job"
+	"chronos/observability"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fakeHandler struct {
@@ -120,6 +123,13 @@ func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 	}
 	defer pool.Close()
 
+	registry := prometheus.NewRegistry()
+
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("failed to create metrics: %v", err)
+	}
+
 	const testID = 998102
 
 	// Remove the test job before and after the test.
@@ -171,6 +181,7 @@ func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 	w := &Worker{
 		Pool:    pool,
 		Handler: handler,
+		Metrics: metrics,
 	}
 
 	ran, err := w.RunOnce(ctx)
@@ -194,6 +205,42 @@ func TestWorkerExecutesJobSuccessfully(t *testing.T) {
 	if saved.Status != "Completed" {
 		t.Fatalf("expected database status Completed, got %s", saved.Status)
 	}
+
+	if got := testutil.ToFloat64(metrics.JobsCompleted); got != 1 {
+		t.Fatalf("expected JobsCompleted to be 1, got %v", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.JobRetries); got != 0 {
+		t.Fatalf("expected JobRetries to be 0, got %v", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.JobsFailed); got != 0 {
+		t.Fatalf("expected JobsFailed to be 0, got %v", got)
+	}
+
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to gather metrics: %v", err)
+	}
+
+	var executionObservationCount uint64
+
+	for _, family := range metricFamilies {
+		if family.GetName() == "chronos_job_execution_duration_seconds" {
+			executionObservationCount = family.GetMetric()[0].
+				GetHistogram().
+				GetSampleCount()
+			break
+		}
+	}
+
+	if executionObservationCount != 1 {
+		t.Fatalf(
+			"expected one job execution duration observation, got %d",
+			executionObservationCount,
+		)
+	}
+
 }
 
 // Pending → Running → Handler fails → Failed
@@ -214,6 +261,13 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 		t.Fatalf("failed to connect to database: %v", err)
 	}
 	defer pool.Close()
+
+	registry := prometheus.NewRegistry()
+
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("failed to create metrics: %v", err)
+	}
 
 	const testID = 3
 	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
@@ -263,6 +317,7 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 	w := &Worker{
 		Pool:    pool,
 		Handler: handler,
+		Metrics: metrics,
 	}
 
 	ran, err := w.RunOnce(ctx)
@@ -300,6 +355,18 @@ func TestWorkerMarksJobFailedWhenHandlerFails(t *testing.T) {
 
 	if saved.NextRetryAt == nil {
 		t.Fatal("expected NextRetryAt to be set")
+	}
+
+	if got := testutil.ToFloat64(metrics.JobRetries); got != 1 {
+		t.Fatalf("expected JobRetries to be 1, got %v", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.JobsFailed); got != 0 {
+		t.Fatalf("expected JobsFailed to be 0, got %v", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.JobsCompleted); got != 0 {
+		t.Fatalf("expected JobsCompleted to be 0, got %v", got)
 	}
 }
 
@@ -353,9 +420,16 @@ func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
 
 	handler := &fakeHandler{}
 
+	registry := prometheus.NewRegistry()
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("create metrics: %v", err)
+	}
+
 	w := &Worker{
 		Pool:    pool,
 		Handler: handler,
+		Metrics: metrics,
 	}
 
 	runDone := make(chan error, 1)
@@ -401,11 +475,19 @@ func TestWorkerRunProcessesMultipleJobs(t *testing.T) {
 		}
 	}
 
+	if got := testutil.ToFloat64(metrics.ActiveWorkers); got != 1 {
+		t.Fatalf("expected ActiveWorkers to be 1 while running, got %v", got)
+	}
+
 	cancel()
 
 	err = <-runDone
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	if got := testutil.ToFloat64(metrics.ActiveWorkers); got != 0 {
+		t.Fatalf("expected ActiveWorkers to return to 0, got %v", got)
 	}
 
 	// Verify both specific test jobs completed successfully.
@@ -466,6 +548,13 @@ func TestWorkerCompletesJobAfterRetry(t *testing.T) {
 
 	defer pool.Close()
 
+	registry := prometheus.NewRegistry()
+
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("failed to create metrics: %v", err)
+	}
+
 	const testID = 4
 	_, err = pool.Exec(ctx, "DELETE FROM jobs WHERE id = $1", testID)
 	if err != nil {
@@ -488,6 +577,23 @@ func TestWorkerCompletesJobAfterRetry(t *testing.T) {
 		t.Fatalf("SaveJob failed: %v", err)
 	}
 
+	_, err = pool.Exec(ctx, `
+    UPDATE jobs
+    SET run_at = COALESCE(
+        (
+            SELECT MIN(run_at) - INTERVAL '1 second'
+            FROM jobs
+            WHERE id <> $1
+        ),
+        NOW() - INTERVAL '1 minute'
+    )
+    WHERE id = $1
+`, testID)
+
+	if err != nil {
+		t.Fatalf("position test job for claiming: %v", err)
+	}
+
 	handler := &fakeHandler{
 		err: errTestExecution,
 	}
@@ -495,6 +601,7 @@ func TestWorkerCompletesJobAfterRetry(t *testing.T) {
 	w := &Worker{
 		Pool:    pool,
 		Handler: handler,
+		Metrics: metrics,
 	}
 
 	ran, err := w.RunOnce(ctx)
@@ -596,6 +703,18 @@ func TestWorkerCompletesJobAfterRetry(t *testing.T) {
 
 	if saved.NextRetryAt != nil {
 		t.Fatal("expected NextRetryAt to be cleared after completion")
+	}
+
+	if got := testutil.ToFloat64(metrics.JobRetries); got != 1 {
+		t.Fatalf("expected JobRetries to be 1, got %v", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.JobsCompleted); got != 1 {
+		t.Fatalf("expected JobsCompleted to be 1, got %v", got)
+	}
+
+	if got := testutil.ToFloat64(metrics.JobsFailed); got != 0 {
+		t.Fatalf("expected JobsFailed to be 0, got %v", got)
 	}
 
 }

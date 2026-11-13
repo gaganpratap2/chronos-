@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type CreateJobRequest struct {
@@ -62,14 +63,10 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, `{"status":"ok"}`)
 }
 
-func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
+func createJobHandler(pool *pgxpool.Pool, metrics *observability.Metrics) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(
-				w,
-				"method not allowed",
-				http.StatusMethodNotAllowed,
-			)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
@@ -79,20 +76,12 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		)
 
 		if idempotencyKey == "" {
-			http.Error(
-				w,
-				"Idempotency-Key header is required",
-				http.StatusBadRequest,
-			)
+			http.Error(w, "Idempotency-Key header is required", http.StatusBadRequest)
 			return
 		}
 
 		if len(idempotencyKey) > 255 {
-			http.Error(
-				w,
-				"Idempotency-Key must not exceed 255 bytes",
-				http.StatusBadRequest,
-			)
+			http.Error(w, "Idempotency-Key must not exceed 255 bytes", http.StatusBadRequest)
 			return
 		}
 
@@ -100,11 +89,7 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		var request CreateJobRequest
 
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			http.Error(
-				w,
-				"invalid JSON",
-				http.StatusBadRequest,
-			)
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
 
@@ -115,11 +100,7 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		)
 
 		if err != nil {
-			http.Error(
-				w,
-				err.Error(),
-				http.StatusBadRequest,
-			)
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
@@ -190,6 +171,7 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				_, writeErr := w.Write(
 					[]byte(`{"status":"processing"}`),
 				)
+
 				if writeErr != nil {
 					slog.Warn(
 						"failed to write in-progress response",
@@ -236,6 +218,10 @@ func createJobHandler(pool *pgxpool.Pool) http.HandlerFunc {
 				http.StatusInternalServerError,
 			)
 			return
+		}
+
+		if !result.Replayed {
+			metrics.JobsCreated.Inc()
 		}
 
 		// Step 7: Send either the newly created result
@@ -459,13 +445,20 @@ func (h AppHandler) ExecuteWithOperations(
 var _ worker.OperationAwareHandler = AppHandler{}
 
 func main() {
+	// if err := godotenv.Load(); err != nil {
+	// 	if err := godotenv.Load(); err != nil {
+	// 		slog.Info(
+	// 			"dotenv file not loaded; using system environment variables",
+	// 			"error", err,
+	// 		)
+	// 	}
+	// }
+
 	if err := godotenv.Load(); err != nil {
-		if err := godotenv.Load(); err != nil {
-			slog.Info(
-				"dotenv file not loaded; using system environment variables",
-				"error", err,
-			)
-		}
+		slog.Info(
+			"dotenv file not loaded; using system environment variables",
+			"error", err,
+		)
 	}
 
 	level, err := observability.ParseLevel(
@@ -499,6 +492,14 @@ func main() {
 
 	appHandler := AppHandler{}
 
+	registry := prometheus.NewRegistry()
+
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		slog.Error("failed to initialize Prometheus metrics", "error", err)
+		os.Exit(1)
+	}
+
 	hostname, err := os.Hostname()
 	if err != nil {
 		slog.Error("failed to get hostname", "error", err)
@@ -516,6 +517,7 @@ func main() {
 		map[string]execution.Provider{
 			appJobProvider: developmentProvider,
 		},
+		metrics,
 	)
 	if err != nil {
 		slog.Error("failed to create operation service", "error", err)
@@ -555,12 +557,21 @@ func main() {
 		"poll_interval", 5*time.Second,
 	)
 
+	// registry := prometheus.NewRegistry()
+
+	// metrics, err := observability.NewMetrics(registry)
+	// if err != nil {
+	// 	slog.Error("failed to initialize Prometheus metrics", "error", err)
+	// 	os.Exit(1)
+	// }
+
 	w := &worker.Worker{
 		WorkerID:          workerID,
 		Pool:              pool,
 		Handler:           appHandler,
 		OperationExecutor: operationService,
 		PollInterval:      500 * time.Millisecond,
+		Metrics:           metrics,
 	}
 
 	workerCtx, workerCancel := signal.NotifyContext(
@@ -568,6 +579,14 @@ func main() {
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
+
+	go runPendingJobsMetrics(
+		workerCtx,
+		pool,
+		metrics,
+		15*time.Second,
+	)
+
 	defer workerCancel()
 
 	go func() {
@@ -593,14 +612,22 @@ func main() {
 		}
 	}()
 
+	metricsHandler, err := observability.NewMetricsHandler(registry)
+	if err != nil {
+		slog.Error("failed to create metrics handler", "error", err)
+		os.Exit(1)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/jobs", createJobHandler(pool))
+	mux.HandleFunc("/jobs", createJobHandler(pool, metrics))
 	mux.HandleFunc("/jobs/{id}", getJobHandler(pool))
 	mux.HandleFunc(
 		"PATCH /jobs/{id}/status",
 		transitionJobStatusHandler(pool),
 	)
+
+	mux.Handle("GET /metrics", metricsHandler)
 
 	mux.HandleFunc(
 		"PATCH /recurring-schedules/{id}/enabled",
@@ -617,11 +644,11 @@ func main() {
 
 	slog.Info(
 		"HTTP server starting",
-		"address", ":8080",
+		"address", ":8081",
 	)
 
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":8081",
 		Handler: mux,
 	}
 

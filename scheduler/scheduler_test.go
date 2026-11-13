@@ -7,6 +7,10 @@ import (
 	"time"
 
 	"chronos/database"
+	"chronos/observability"
+
+	"github.com/prometheus/client_golang/prometheus"
+	// "github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/joho/godotenv"
 )
@@ -56,6 +60,13 @@ func TestSchedulerRunOnceDispatchesTask(t *testing.T) {
 		t.Fatalf("connect database: %v", err)
 	}
 	defer pool.Close()
+
+	registry := prometheus.NewRegistry()
+
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("create metrics: %v", err)
+	}
 
 	const (
 		workflowID = int64(999301)
@@ -108,10 +119,32 @@ func TestSchedulerRunOnceDispatchesTask(t *testing.T) {
 	}
 
 	s := New(pool)
+	s.Metrics = metrics
 
 	err = s.RunOnce(ctx)
 	if err != nil {
 		t.Fatalf("scheduler RunOnce: %v", err)
+	}
+
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+
+	var observationCount uint64
+
+	for _, family := range metricFamilies {
+		if family.GetName() == "chronos_scheduler_dispatch_duration_seconds" {
+			observationCount = family.GetMetric()[0].GetHistogram().GetSampleCount()
+			break
+		}
+	}
+
+	if observationCount != 1 {
+		t.Fatalf(
+			"expected one scheduler dispatch duration observation, got %d",
+			observationCount,
+		)
 	}
 
 	// Verify task was dispatched.

@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"chronos/database"
+	"chronos/observability"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -290,13 +293,21 @@ func TestOperationServiceWithDevelopmentProvider(t *testing.T) {
 		t.Fatalf("create development provider: %v", err)
 	}
 
-	// Register the provider with the operation service.
+	registry := prometheus.NewRegistry()
+
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("create metrics: %v", err)
+	}
+
 	operationService, err := NewOperationService(
 		f.pool,
 		map[string]Provider{
 			"development": provider,
 		},
+		metrics,
 	)
+
 	if err != nil {
 		t.Fatalf("create operation service: %v", err)
 	}
@@ -447,11 +458,42 @@ func TestOperationServiceWithDevelopmentProvider(t *testing.T) {
 			receiptReference,
 		)
 	}
+
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+
+	var observationCount uint64
+
+	for _, family := range metricFamilies {
+		if family.GetName() == "chronos_external_operation_duration_seconds" {
+			observationCount = family.GetMetric()[0].
+				GetHistogram().
+				GetSampleCount()
+			break
+		}
+	}
+
+	if observationCount != 1 {
+		t.Fatalf(
+			"expected one external operation duration observation, got %d",
+			observationCount,
+		)
+	}
 }
 
 func TestOperationServiceRecoversAfterProviderResponseLoss(
 	t *testing.T,
 ) {
+
+	registry := prometheus.NewRegistry()
+
+	metrics, err := observability.NewMetrics(registry)
+	if err != nil {
+		t.Fatalf("create metrics: %v", err)
+	}
+
 	f := newDevelopmentProviderIntegrationFixture(t)
 
 	// Create the underlying development provider.
@@ -471,6 +513,7 @@ func TestOperationServiceRecoversAfterProviderResponseLoss(
 		map[string]Provider{
 			"development": provider,
 		},
+		metrics,
 	)
 	if err != nil {
 		t.Fatalf("create operation service: %v", err)
@@ -718,4 +761,28 @@ func TestOperationServiceRecoversAfterProviderResponseLoss(
 			receiptCount,
 		)
 	}
+
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+
+	var observationCount uint64
+
+	for _, family := range metricFamilies {
+		if family.GetName() == "chronos_external_operation_duration_seconds" {
+			observationCount = family.GetMetric()[0].
+				GetHistogram().
+				GetSampleCount()
+			break
+		}
+	}
+
+	if observationCount != 2 {
+		t.Fatalf(
+			"expected two external operation duration observations (Execute + Lookup), got %d",
+			observationCount,
+		)
+	}
+
 }

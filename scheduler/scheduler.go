@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"chronos/observability"
 	"context"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ type Scheduler struct {
 	Hostname          string
 	LeaseDuration     time.Duration
 	HeartbeatInterval time.Duration
+	Metrics           *observability.Metrics
 }
 
 func New(pool *pgxpool.Pool) *Scheduler {
@@ -293,6 +295,16 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	}
 	if s.InstanceID == "" {
 		return errors.New("scheduler instance ID is empty")
+	}
+
+	start := time.Now()
+
+	if s.Metrics != nil {
+		defer func() {
+			s.Metrics.SchedulerDispatchDuration.Observe(
+				time.Since(start).Seconds(),
+			)
+		}()
 	}
 
 	leaseDuration := s.LeaseDuration

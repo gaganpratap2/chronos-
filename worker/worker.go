@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	// "log"
+	"chronos/observability"
 	"time"
 
 	"chronos/database"
@@ -43,6 +44,7 @@ type Worker struct {
 	RetryPolicy       job.RetryPolicy
 	HeartbeatInterval time.Duration
 	OperationExecutor execution.OperationExecutor
+	Metrics           *observability.Metrics
 }
 
 // The Worker is responsible for picking up jobs and managing their execution. The Handler is responsible for actually doing the job.
@@ -116,6 +118,12 @@ func (w *Worker) runOnce(
 		return false, fmt.Errorf("claim job: %w", err)
 	}
 
+	// Track the job while this worker processes it.
+	if w.Metrics != nil {
+		w.Metrics.JobsRunning.Inc()
+		defer w.Metrics.JobsRunning.Dec()
+	}
+
 	// Step 2: Start the heartbeat.
 	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
 	heartbeatErrCh := make(chan error, 1)
@@ -133,6 +141,8 @@ func (w *Worker) runOnce(
 
 		heartbeatErrCh <- heartbeatErr
 	}()
+
+	executionStarted := time.Now()
 
 	// Step 3: Execute the handler.
 	var executionErr error
@@ -170,6 +180,12 @@ func (w *Worker) runOnce(
 		}
 	} else {
 		executionErr = w.Handler.Execute(heartbeatCtx, j)
+	}
+
+	if w.Metrics != nil {
+		w.Metrics.JobExecutionDuration.Observe(
+			time.Since(executionStarted).Seconds(),
+		)
 	}
 
 	// Step 4: Stop the heartbeat and wait for it to exit.
@@ -210,6 +226,11 @@ func (w *Worker) runOnce(
 		// A confirmed provider failure is terminal.
 		// Do not schedule another retry for this logical operation.
 		if errors.Is(executionErr, execution.ErrOperationFailed) {
+
+			if w.Metrics != nil {
+				w.Metrics.JobsFailed.Inc()
+			}
+
 			if err := database.ReconcileWorkflowForJob(
 				ctx,
 				w.Pool,
@@ -235,6 +256,11 @@ func (w *Worker) runOnce(
 
 		if retryErr != nil {
 			if errors.Is(retryErr, job.ErrRetriesExhausted) {
+
+				if w.Metrics != nil {
+					w.Metrics.JobsFailed.Inc()
+				}
+
 				if err := database.ReconcileWorkflowForJob(
 					ctx,
 					w.Pool,
@@ -261,6 +287,10 @@ func (w *Worker) runOnce(
 			)
 		}
 
+		if w.Metrics != nil {
+			w.Metrics.JobRetries.Inc()
+		}
+
 		return true, nil
 	}
 
@@ -281,6 +311,10 @@ func (w *Worker) runOnce(
 		)
 	}
 
+	if w.Metrics != nil {
+		w.Metrics.JobsCompleted.Inc()
+	}
+
 	if err := database.ReconcileWorkflowForJob(
 		ctx,
 		w.Pool,
@@ -292,6 +326,10 @@ func (w *Worker) runOnce(
 			err,
 		)
 	}
+
+	// if w.Metrics != nil {
+	// 	w.Metrics.JobRetries.Inc()
+	// }
 
 	return true, nil
 }
@@ -310,6 +348,15 @@ Run() returns nil
 
 // Run continuously processes available jobs until the context is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if w.Metrics != nil {
+		w.Metrics.ActiveWorkers.Inc()
+		defer w.Metrics.ActiveWorkers.Dec()
+	}
 
 	pollInterval := w.PollInterval
 	if pollInterval <= 0 {
