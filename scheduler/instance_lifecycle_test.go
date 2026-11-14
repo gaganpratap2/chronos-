@@ -53,8 +53,8 @@ func TestSchedulerInstanceRuntimeLifecycle(t *testing.T) {
 		InstanceID:        instanceID,
 		Hostname:          "scheduler-test-host",
 		PollInterval:      time.Hour,
-		LeaseDuration:     600 * time.Millisecond,
-		HeartbeatInterval: 100 * time.Millisecond,
+		LeaseDuration:     5 * time.Second,
+		HeartbeatInterval: 250 * time.Millisecond,
 
 		// Prevent real workflow task dispatch.
 		RunOnceFunc: func(context.Context) error {
@@ -97,21 +97,38 @@ func TestSchedulerInstanceRuntimeLifecycle(t *testing.T) {
 	}
 
 	// Step 2: Wait for at least one heartbeat renewal.
-	time.Sleep(250 * time.Millisecond)
-
+	// Step 2: Wait until at least one heartbeat renewal is recorded.
 	var renewedHeartbeat time.Time
 	var leaseUntil time.Time
 
-	err = pool.QueryRow(
-		ctx,
-		`SELECT last_heartbeat_at, lease_until
+	heartbeatDeadline := time.Now().Add(3 * time.Second)
+
+	for time.Now().Before(heartbeatDeadline) {
+		err = pool.QueryRow(
+			ctx,
+			`SELECT last_heartbeat_at, lease_until
 		 FROM scheduler_instances
 		 WHERE id = $1 AND status = 'running'`,
-		instanceID,
-	).Scan(&renewedHeartbeat, &leaseUntil)
+			instanceID,
+		).Scan(&renewedHeartbeat, &leaseUntil)
+
+		if err == nil && renewedHeartbeat.After(initialHeartbeat) {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context ended while waiting for heartbeat: %v", ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 
 	if err != nil {
 		t.Fatalf("read renewed scheduler lease: %v", err)
+	}
+
+	if !renewedHeartbeat.After(initialHeartbeat) {
+		t.Fatal("scheduler heartbeat was not renewed")
 	}
 
 	if !renewedHeartbeat.After(initialHeartbeat) {

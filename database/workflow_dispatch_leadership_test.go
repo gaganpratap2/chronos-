@@ -486,3 +486,149 @@ func TestClaimTaskAndCreateJobAsValidLeader(t *testing.T) {
 		fencingToken,
 	)
 }
+
+func TestClaimTaskAndCreateJobAsLeaderRejectsPreviousLeaderAfterTakeover(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := godotenv.Load("../.env"); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+
+	pool, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect database: %v", err)
+	}
+	defer pool.Close()
+
+	var leadershipAvailable bool
+	err = pool.QueryRow(ctx, `
+		SELECT instance_id IS NULL
+		    OR lease_until <= clock_timestamp()
+		FROM scheduler_leadership
+		WHERE singleton_id = 1
+	`).Scan(&leadershipAvailable)
+	if err != nil {
+		t.Fatalf("check leadership availability: %v", err)
+	}
+	if !leadershipAvailable {
+		t.Skip("another scheduler currently owns active leadership")
+	}
+
+	uniqueID := time.Now().UnixNano()
+	instanceA := fmt.Sprintf("takeover-a-%d", uniqueID)
+	instanceB := fmt.Sprintf("takeover-b-%d", uniqueID)
+	workflowID := uniqueID
+	taskID := uniqueID + 1
+
+	const leaseDuration = 30 * time.Second
+
+	for _, instanceID := range []string{instanceA, instanceB} {
+		if err := RegisterSchedulerInstance(
+			ctx, pool, instanceID, "takeover-test-host", leaseDuration,
+		); err != nil {
+			t.Fatalf("register scheduler %s: %v", instanceID, err)
+		}
+	}
+
+	var tokenA, tokenB int64
+	var jobID int64
+
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(), 5*time.Second,
+		)
+		defer cleanupCancel()
+
+		if jobID > 0 {
+			_, _ = pool.Exec(cleanupCtx, `DELETE FROM jobs WHERE id = $1`, jobID)
+		}
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM workflows WHERE id = $1`, workflowID)
+
+		_, _ = pool.Exec(cleanupCtx, `
+			UPDATE scheduler_leadership
+			SET instance_id = NULL, lease_until = NULL, updated_at = NOW()
+			WHERE singleton_id = 1 AND instance_id = ANY($1)
+		`, []string{instanceA, instanceB})
+
+		for _, instanceID := range []string{instanceA, instanceB} {
+			_ = StopSchedulerInstance(cleanupCtx, pool, instanceID)
+			_, _ = pool.Exec(cleanupCtx,
+				`DELETE FROM scheduler_instances WHERE id = $1`, instanceID)
+		}
+	}()
+
+	leadershipA, err := AcquireSchedulerLeadership(
+		ctx, pool, instanceA, leaseDuration,
+	)
+	if err != nil {
+		t.Fatalf("scheduler A acquire leadership: %v", err)
+	}
+	tokenA = leadershipA.FencingToken
+
+	// Expire A's leadership, while keeping its instance registered.
+	_, err = pool.Exec(ctx, `
+		UPDATE scheduler_leadership
+		SET lease_until = clock_timestamp() - INTERVAL '1 second'
+		WHERE singleton_id = 1 AND instance_id = $1
+	`, instanceA)
+	if err != nil {
+		t.Fatalf("expire scheduler A leadership: %v", err)
+	}
+
+	leadershipB, err := AcquireSchedulerLeadership(
+		ctx, pool, instanceB, leaseDuration,
+	)
+	if err != nil {
+		t.Fatalf("scheduler B take over leadership: %v", err)
+	}
+	tokenB = leadershipB.FencingToken
+
+	if tokenB <= tokenA {
+		t.Fatalf("expected B token %d > A token %d", tokenB, tokenA)
+	}
+
+	// Create one runnable task for the new leader to dispatch.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO workflows (id, name, status)
+		VALUES ($1, $2, 'Pending')
+	`, workflowID, "leadership-takeover-test")
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO workflow_tasks (id, workflow_id, name, status)
+		VALUES ($1, $2, $3, 'Pending')
+	`, taskID, workflowID, "takeover-dispatch-task")
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	// The previous leader must be rejected.
+	_, err = ClaimTaskAndCreateJobAsLeader(ctx, pool, instanceA, tokenA)
+	if !errors.Is(err, ErrSchedulerLeaseLost) {
+		t.Fatalf("expected old leader to be rejected, got: %v", err)
+	}
+
+	// The new leader must be able to dispatch.
+	dispatched, err := ClaimTaskAndCreateJobAsLeader(
+		ctx, pool, instanceB, tokenB,
+	)
+	if err != nil {
+		t.Fatalf("new leader dispatch: %v", err)
+	}
+	if dispatched == nil {
+		t.Fatal("expected new leader to dispatch a task")
+	}
+	if dispatched.TaskID != taskID {
+		t.Fatalf("expected task %d, got %d", taskID, dispatched.TaskID)
+	}
+
+	jobID = dispatched.JobID
+
+	t.Logf(
+		"takeover verified: A token=%d rejected; B token=%d dispatched task=%d",
+		tokenA, tokenB, taskID,
+	)
+}
