@@ -1,5 +1,0 @@
-[33m859fbcc[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m fix: enhance worker resilience and recovery during database outages
-[33me4fdb19[m implement graceful application shutdown
-[33m36faaa1[m add application readiness checks
-[33md5d9785[m add Prometheus and Grafana monitoring
-[33m63707f8[m add Prometheus metrics for calculation
