@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -594,48 +595,71 @@ func main() {
 	// }
 
 	w := &worker.Worker{
-		WorkerID:          workerID,
-		Pool:              pool,
-		Handler:           appHandler,
-		OperationExecutor: operationService,
-		PollInterval:      500 * time.Millisecond,
-		Metrics:           metrics,
+		WorkerID:             workerID,
+		Pool:                 pool,
+		Handler:              appHandler,
+		OperationExecutor:    operationService,
+		PollInterval:         500 * time.Millisecond,
+		Metrics:              metrics,
+		ShutdownDrainTimeout: 25 * time.Second,
 	}
 
-	workerCtx, workerCancel := signal.NotifyContext(
+	// The signal context controls the application's shutdown sequence.
+	signalCtx, stopSignals := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
+	defer stopSignals()
 
-	go runPendingJobsMetrics(
-		workerCtx,
-		pool,
-		metrics,
-		15*time.Second,
+	// The worker context is cancelled only after HTTP has drained.
+	workerCtx, workerCancel := context.WithCancel(
+		context.Background(),
 	)
-
 	defer workerCancel()
 
+	var backgroundWG sync.WaitGroup
+	backgroundErrCh := make(chan error, 2)
+
+	// Pending-job metrics loop.
+	backgroundWG.Add(1)
 	go func() {
-		if err := w.Run(workerCtx); err != nil {
-			slog.Error(
-				"worker stopped unexpectedly",
-				"worker_id", workerID,
-				"error", err,
+		defer backgroundWG.Done()
+
+		runPendingJobsMetrics(
+			workerCtx,
+			pool,
+			metrics,
+			15*time.Second,
+		)
+	}()
+
+	// Main worker.
+	backgroundWG.Add(1)
+	go func() {
+		defer backgroundWG.Done()
+
+		if err := w.Run(workerCtx); err != nil &&
+			workerCtx.Err() == nil {
+			backgroundErrCh <- fmt.Errorf(
+				"worker stopped unexpectedly: %w",
+				err,
 			)
 		}
 	}()
 
+	// Recovery processor.
+	backgroundWG.Add(1)
 	go func() {
+		defer backgroundWG.Done()
+
 		if err := recoveryProcessor.Run(
 			workerCtx,
 			5*time.Second,
-		); err != nil {
-			slog.Error(
-				"recovery processor stopped unexpectedly",
-				"worker_id", recoveryWorkerID,
-				"error", err,
+		); err != nil && workerCtx.Err() == nil {
+			backgroundErrCh <- fmt.Errorf(
+				"recovery processor stopped unexpectedly: %w",
+				err,
 			)
 		}
 	}()
@@ -671,39 +695,92 @@ func main() {
 		rescheduleCronHandler(pool),
 	)
 
-	slog.Info(
-		"HTTP server starting",
-		"address", ":8081",
-	)
-
 	server := &http.Server{
 		Addr:    ":8081",
 		Handler: mux,
 	}
 
+	serverErrCh := make(chan error, 1)
+
+	slog.Info(
+		"HTTP server starting",
+		"address", server.Addr,
+	)
+
+	backgroundWG.Add(1)
 	go func() {
+		defer backgroundWG.Done()
+
 		if err := server.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
-			slog.Error(
-				"HTTP server failed",
-				"error", err,
-			)
-			workerCancel()
+			serverErrCh <- err
 		}
 	}()
 
-	<-workerCtx.Done()
+	// Wait for a shutdown signal or an unexpected component failure.
+	select {
+	case <-signalCtx.Done():
+		slog.Info("shutdown signal received")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(
+	case err := <-serverErrCh:
+		slog.Error("HTTP server failed", "error", err)
+
+	case err := <-backgroundErrCh:
+		slog.Error("background component failed", "error", err)
+	}
+
+	// Step 1: Stop accepting HTTP requests and drain active requests.
+	httpShutdownCtx, httpShutdownCancel := context.WithTimeout(
 		context.Background(),
-		5*time.Second,
+		10*time.Second,
 	)
-	defer shutdownCancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	if err := server.Shutdown(httpShutdownCtx); err != nil {
 		slog.Error(
 			"HTTP server shutdown failed",
 			"error", err,
 		)
+		_ = server.Close()
 	}
+
+	httpShutdownCancel()
+
+	// Step 2: Stop new worker claims and recovery/metrics loops.
+	// Already-claimed jobs receive their configured drain period.
+	slog.Info(
+		"stopping background workers",
+		"job_drain_timeout", w.ShutdownDrainTimeout,
+	)
+	workerCancel()
+
+	// Step 3: Wait for all background goroutines before closing the DB.
+	backgroundDone := make(chan struct{})
+
+	go func() {
+		backgroundWG.Wait()
+		close(backgroundDone)
+	}()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(
+		context.Background(),
+		35*time.Second,
+	)
+	defer shutdownCancel()
+
+	select {
+	case <-backgroundDone:
+		slog.Info("all background goroutines stopped")
+
+	case <-shutdownCtx.Done():
+		slog.Error(
+			"background shutdown exceeded its deadline; waiting before closing database",
+			"error", shutdownCtx.Err(),
+		)
+
+		// Keep the database pool open until its users have stopped.
+		// Docker's stop_grace_period provides the outer process limit.
+		<-backgroundDone
+	}
+
+	slog.Info("Chronos shutdown complete")
 }

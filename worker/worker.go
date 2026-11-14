@@ -6,6 +6,7 @@ import (
 	"fmt"
 	// "log"
 	"chronos/observability"
+	"sync"
 	"time"
 
 	"chronos/database"
@@ -37,14 +38,15 @@ type OperationAwareHandler interface {
 }
 
 type Worker struct {
-	WorkerID          string
-	Pool              *pgxpool.Pool
-	Handler           Handler
-	PollInterval      time.Duration
-	RetryPolicy       job.RetryPolicy
-	HeartbeatInterval time.Duration
-	OperationExecutor execution.OperationExecutor
-	Metrics           *observability.Metrics
+	WorkerID             string
+	Pool                 *pgxpool.Pool
+	Handler              Handler
+	PollInterval         time.Duration
+	RetryPolicy          job.RetryPolicy
+	HeartbeatInterval    time.Duration
+	OperationExecutor    execution.OperationExecutor
+	Metrics              *observability.Metrics
+	ShutdownDrainTimeout time.Duration
 }
 
 // The Worker is responsible for picking up jobs and managing their execution. The Handler is responsible for actually doing the job.
@@ -118,6 +120,13 @@ func (w *Worker) runOnce(
 		return false, fmt.Errorf("claim job: %w", err)
 	}
 
+	// Allow an already-claimed job to drain during shutdown.
+	executionCtx, finishExecution := newExecutionContext(
+		ctx,
+		w.ShutdownDrainTimeout,
+	)
+	defer finishExecution()
+
 	// Track the job while this worker processes it.
 	if w.Metrics != nil {
 		w.Metrics.JobsRunning.Inc()
@@ -125,7 +134,8 @@ func (w *Worker) runOnce(
 	}
 
 	// Step 2: Start the heartbeat.
-	heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	// heartbeatCtx, heartbeatCancel := context.WithCancel(ctx)
+	heartbeatCtx, heartbeatCancel := context.WithCancel(executionCtx)
 	heartbeatErrCh := make(chan error, 1)
 
 	go func() {
@@ -201,8 +211,12 @@ func (w *Worker) runOnce(
 		)
 	}
 
-	if ctx.Err() != nil {
-		return true, ctx.Err()
+	if executionCtx.Err() != nil {
+		return true, fmt.Errorf(
+			"job %d execution stopped before completion: %w",
+			j.ID,
+			executionCtx.Err(),
+		)
 	}
 
 	// Step 6: Handle execution failure.
@@ -440,4 +454,50 @@ func (w *Worker) heartbeat(
 			}
 		}
 	}
+}
+
+// newExecutionContext allows a claimed job to finish after the worker
+// receives a shutdown cancellation. If the drain timeout expires,
+// the job execution and heartbeat are cancelled.
+func newExecutionContext(
+	ctx context.Context,
+	drainTimeout time.Duration,
+) (context.Context, func()) {
+	if drainTimeout <= 0 {
+		return ctx, func() {}
+	}
+
+	executionCtx, cancel := context.WithCancel(
+		context.WithoutCancel(ctx),
+	)
+
+	finished := make(chan struct{})
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			timer := time.NewTimer(drainTimeout)
+			defer timer.Stop()
+
+			select {
+			case <-timer.C:
+				cancel()
+			case <-finished:
+			}
+
+		case <-finished:
+		}
+	}()
+
+	var finishOnce sync.Once
+
+	finish := func() {
+		finishOnce.Do(func() {
+			close(finished)
+			cancel()
+		})
+	}
+
+	return executionCtx, finish
+
 }

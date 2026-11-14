@@ -39,6 +39,7 @@ services:
       timeout: 3s
       start_period: 10s
       retries: 3
+    stop_grace_period: 40s
     restart: unless-stopped
 
   prometheus:
