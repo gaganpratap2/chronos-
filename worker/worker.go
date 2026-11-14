@@ -4,14 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	// "log"
-	"chronos/observability"
+	"log/slog"
 	"sync"
 	"time"
 
 	"chronos/database"
 	"chronos/execution"
 	"chronos/job"
+	"chronos/observability"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -362,9 +362,27 @@ Run() returns nil
 
 // Run continuously processes available jobs until the context is cancelled.
 func (w *Worker) Run(ctx context.Context) error {
-
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+
+	// Validate configuration before entering the retry loop.
+	if w.Pool == nil {
+		return errors.New("worker database pool is nil")
+	}
+
+	if w.Handler == nil {
+		return errors.New("worker handler is nil")
+	}
+
+	if operationHandler, ok := w.Handler.(OperationAwareHandler); ok {
+		_ = operationHandler
+
+		if w.OperationExecutor == nil {
+			return errors.New(
+				"operation-aware handler requires an operation executor",
+			)
+		}
 	}
 
 	if w.Metrics != nil {
@@ -377,25 +395,75 @@ func (w *Worker) Run(ctx context.Context) error {
 		pollInterval = 500 * time.Millisecond
 	}
 
+	const maxRetryDelay = 30 * time.Second
+
+	retryDelay := pollInterval
+	if retryDelay > maxRetryDelay {
+		retryDelay = maxRetryDelay
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
 		ran, err := w.RunOnce(ctx)
+
 		if err != nil {
-			return err
+			// Cancellation is a normal shutdown condition.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			slog.Error(
+				"worker iteration failed; will retry",
+				"worker_id", w.WorkerID,
+				"error", err,
+				"retry_in", retryDelay,
+			)
+
+			timer := time.NewTimer(retryDelay)
+
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ctx.Err()
+
+			case <-timer.C:
+			}
+
+			// Exponential backoff, capped at 30 seconds.
+			if retryDelay < maxRetryDelay/2 {
+				retryDelay *= 2
+			} else {
+				retryDelay = maxRetryDelay
+			}
+
+			continue
+		}
+
+		// A successful iteration resets the backoff.
+		retryDelay = pollInterval
+		if retryDelay > maxRetryDelay {
+			retryDelay = maxRetryDelay
 		}
 
 		if ran {
 			continue
 		}
 
+		timer := time.NewTimer(pollInterval)
+
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return ctx.Err()
 
-		case <-time.After(pollInterval):
+		case <-timer.C:
 		}
 	}
 }

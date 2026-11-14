@@ -47,6 +47,6 @@ COPY --from=builder /out/chronos /app/chronos
 # Run without root privileges.
 USER 10001:10001
 
-EXPOSE 8080
+EXPOSE 8081
 
 ENTRYPOINT ["/app/chronos"]

@@ -20,6 +20,8 @@ services:
       start_period: 10s
       retries: 3
     restart: unless-stopped
+    cpus: "1.5"
+    mem_limit: 1g
 
   app:
     build:
@@ -41,6 +43,8 @@ services:
       retries: 3
     stop_grace_period: 40s
     restart: unless-stopped
+    cpus: "2.0"
+    mem_limit: 512m
 
   prometheus:
     image: prom/prometheus:v3.16.0
@@ -57,6 +61,8 @@ services:
       app:
         condition: service_healthy
     restart: unless-stopped
+    cpus: "0.5"
+    mem_limit: 512m
 
   grafana:
     image: grafana/grafana:13.3.1
@@ -74,8 +80,12 @@ services:
       prometheus:
         condition: service_started
     restart: unless-stopped
+    cpus: "1.0"
+    mem_limit: 768m
 
 volumes:
   chronos_postgres_data:
   chronos_prometheus_data:
   chronos_grafana_data:
+  
+  
